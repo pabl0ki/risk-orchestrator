@@ -1,0 +1,137 @@
+"""Локальный API, статический интерфейс и запуск отдельного процесса worker."""
+import argparse
+import multiprocessing
+import socket
+import webbrowser
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
+
+from engine import CATALOG, LABELS, Engine
+from scenarios import SCENARIOS, launch_batch
+from worker import run_worker
+
+ROOT = Path(__file__).resolve().parent
+USERS = {"admin": "Оператор", "analyst": "Анна", "reviewer": "Риск-менеджер", "director": "Директор"}
+
+
+def create_app(database, duration):
+    engine = Engine(database)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        ctx = multiprocessing.get_context("spawn")
+        stop = ctx.Event()
+        worker = ctx.Process(target=run_worker, args=(database, duration, stop), daemon=True)
+        worker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            worker.join(3)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join()
+
+    api = FastAPI(title="Risk Orchestrator", lifespan=lifespan)
+
+    @api.exception_handler(ValueError)
+    async def invalid(request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=400)
+
+    def role(request):
+        return request.cookies.get("demo_role", "admin")
+
+    def require(request, *roles):
+        if role(request) not in roles:
+            raise HTTPException(403, "Действие недоступно для этой роли.")
+        return USERS[role(request)]
+
+    @api.post("/api/role/{selected}")
+    def switch(selected: str, response: Response):
+        if selected not in USERS:
+            raise ValueError("Неизвестная роль")
+        response.set_cookie("demo_role", selected, httponly=True, samesite="strict")
+        return {"role": selected}
+
+    @api.get("/api/state")
+    def state(request: Request):
+        user = require(request, *USERS)
+        snapshot = engine.snapshot()
+        jobs = snapshot["jobs"]
+        if role(request) == "analyst":
+            owned = {r["job"] for r in snapshot["requests"] if r["actor"] == user}
+            jobs = [j for j in jobs if j["id"] in owned]
+        if role(request) in ("reviewer", "director"):
+            stage = "pending" if role(request) == "reviewer" else "reviewed"
+            jobs = [j for j in jobs if j["status"] == "review" and snapshot["results"][j["result"]]["approval"] == stage]
+        ids = {j["id"] for j in jobs}
+        for j in jobs:
+            j.pop("token")
+            j["inputs"] = {k:v["id"] for k,v in j["inputs"].items()}
+            j["version"] = snapshot["results"].get(j["result"], {}).copy()
+            j["version"].pop("token", None)
+            j["initiators"] = [r["actor"] for r in snapshot["requests"] if r["job"] == j["id"]]
+        return dict(jobs=jobs, role=role(request), catalog={k:v[0] for k,v in CATALOG.items()},
+                    scenarios=SCENARIOS if role(request)=="admin" else {},
+                    batches=snapshot.get("demo_batches", []) if role(request)=="admin" else [],
+                    labels=LABELS, events=[e for e in snapshot["events"] if e["job"] in ids or role(request)=="admin"])
+
+    @api.post("/api/demo")
+    def demo(request: Request, scenario: str = "basic"):
+        require(request, "admin")
+        return launch_batch(engine, scenario)
+
+    @api.post("/api/run")
+    def launch(request: Request, data: dict):
+        actor = require(request, "admin","analyst")
+        if not isinstance(data.get("day"), str) or data.get("kind") not in CATALOG:
+            raise ValueError("Выберите процесс и бизнес-дату.")
+        return {"id":engine.submit(dict(kind=data["kind"],day=data["day"], actor=actor,
+                                        parent=data.get("parent"), approval=True, key=data.get("key")))}
+
+    @api.post("/api/jobs/{jid}/cancel")
+    def cancel(jid: int, request: Request):
+        require(request,"admin")
+        engine.control(jid,"cancel")
+        return {"id":jid}
+
+    @api.post("/api/jobs/{jid}/decision")
+    def decide(jid: int, request: Request, data: dict):
+        actor = require(request,"reviewer","director")
+        if not all(isinstance(data.get(k), str) and data[k] for k in ("version","decision","key")):
+            raise ValueError("Нужны решение, версия и ID команды.")
+        return {"successor":engine.decide(jid,data["decision"],actor,data["key"],data.get("comment",""),data["version"])}
+
+    @api.get("/")
+    def index():
+        return FileResponse(ROOT / "index.html")
+
+    @api.get("/{asset}")
+    def asset(asset: str):
+        if asset not in ("app.js","style.css"):
+            raise HTTPException(404)
+        return FileResponse(ROOT / asset)
+
+    return api
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", default=str(ROOT / "stage4.sqlite3"))
+    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--duration", type=float, default=4)
+    parser.add_argument("--open", action="store_true")
+    args = parser.parse_args()
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", args.port))
+        url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        print(url, flush=True)
+        if args.open:
+            import threading
+            threading.Timer(1, webbrowser.open, args=(url,)).start()
+        server = uvicorn.Server(uvicorn.Config(create_app(args.db, max(.05, args.duration)), log_level="warning"))
+        server.run(sockets=[sock])
