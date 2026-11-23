@@ -1,10 +1,14 @@
 """Локальный API, статический интерфейс и запуск отдельного процесса worker."""
 import argparse
+import errno
+import hashlib
+import json
 import multiprocessing
 import socket
 import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
+from http.client import HTTPConnection, HTTPException as HTTPClientError
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -18,6 +22,23 @@ from .worker import run_worker
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
 USERS = {"admin": "Оператор", "analyst": "Анна", "reviewer": "Риск-менеджер", "director": "Директор"}
+
+
+def instance_id(database):
+    return hashlib.sha256(str(Path(database).resolve()).encode()).hexdigest()
+
+
+def matches_instance(port, database):
+    connection = HTTPConnection("127.0.0.1", port, timeout=1)
+    try:
+        connection.request("GET", "/api/instance")
+        response = connection.getresponse()
+        return response.status == 200 and json.loads(response.read(1024)) == {
+            "application": "risk-stage4", "database": instance_id(database)}
+    except (OSError, ValueError, HTTPClientError):
+        return False
+    finally:
+        connection.close()
 
 
 def create_app(database, duration):
@@ -39,6 +60,10 @@ def create_app(database, duration):
                 worker.join()
 
     api = FastAPI(title="Risk Orchestrator", lifespan=lifespan)
+
+    @api.get("/api/instance")
+    def instance():
+        return {"application": "risk-stage4", "database": instance_id(database)}
 
     @api.exception_handler(ValueError)
     async def invalid(request, exc):
@@ -140,12 +165,27 @@ def create_app(database, duration):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default=str(ROOT / "data" / "stage4.sqlite3"))
-    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--port", type=int)
     parser.add_argument("--duration", type=float, default=4)
     parser.add_argument("--open", action="store_true")
     args = parser.parse_args()
     with socket.socket() as sock:
-        sock.bind(("127.0.0.1", args.port))
+        ports = range(8766, 8776) if args.port is None else [args.port]
+        for port in ports:
+            try:
+                sock.bind(("127.0.0.1", port))
+                break
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE and getattr(exc, "winerror", None) != 10048:
+                    raise
+                if matches_instance(port, args.db):
+                    url = f"http://127.0.0.1:{port}"
+                    print(f"Стенд уже работает: {url}", flush=True)
+                    if args.open:
+                        webbrowser.open(url)
+                    raise SystemExit(0)
+        else:
+            raise SystemExit("Порт занят. Укажите свободный порт: python start.py --port 0 --open")
         url = f"http://127.0.0.1:{sock.getsockname()[1]}"
         print(url, flush=True)
         if args.open:
