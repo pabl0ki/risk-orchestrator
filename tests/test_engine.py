@@ -1,10 +1,10 @@
-"""Воспроизводимые сценарии. python -m unittest -v test_engine"""
+"""Воспроизводимые сценарии. python -m unittest discover -s tests -v"""
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from engine import Engine, calculate, now
+from backend.engine import Engine, calculate, now
 
 DAY = "2026-11-10"
 

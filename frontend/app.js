@@ -112,7 +112,7 @@ function render() {
     review = reviewRole(),
     nav = review ? ["review"] : Object.keys(tabs).filter((t) => t !== "review" && (t !== "scenarios" || state.role === "admin"));
   el("scenario").hidden = state.role !== "admin";
-  el("openDemos").setAttribute("aria-haspopup", state.role === "admin" ? "false" : "dialog");
+  el("openDemos").hidden = state.role !== "admin";
   syncOptions(el("scenario"), Object.entries(state.scenarios).map(([k,v])=>[k,v[0]]));
   el("history").hidden = tab !== "scenarios" || !state.batches.length;
   syncOptions(el("batch"),state.batches.slice().reverse().map(b=>[b.id,`№${b.id} · ${state.scenarios[b.scenario][0]} · ${b.day}`]));
@@ -230,6 +230,38 @@ function render() {
   el("view").innerHTML = html;
   if (el("details").open) renderDetail();
 }
+const number = new Intl.NumberFormat("ru-RU", {maximumFractionDigits: 2});
+function approvalView(j) {
+  const a = j.assessment;
+  if (!a) return "<p>Чтобы загрузить сводку согласования, перезапустите сервер этапа 4.</p>";
+  const director = state.role === "director";
+  const indicator = {P1:"Кредитный риск",P2:"Рыночный риск",Z1:"Значения сделок",Z2:"Значения курсов",FX:"Значения справочника"}[j.kind];
+  const measure = label => `<div class="approval-fact"><small>${label}</small>`;
+  const delta = a.previous_total === null ? null : a.total - a.previous_total;
+  let html = `<p class="approval-context">${director?"Утверждение к публикации":"Проверка расчёта"} · Бизнес-дата <b>${escapeHtml(j.day)}</b> · Инициатор ${j.initiators.map(escapeHtml).join(", ")}</p>
+    <div class="approval-grid">
+      ${measure(indicator+" · сумма по строкам")}<b>${number.format(a.total)} усл. ед.</b></div>
+      ${measure("Версия результата")}<b>${escapeHtml(j.result)}</b></div>
+      ${measure("Обработано строк")}<b>${a.count}</b></div>
+      ${measure("Изменение к предыдущей публикации")}<b>${delta===null?"Первая публикация":(delta>0?"+":"")+number.format(delta)+" усл. ед."}</b>${delta===null?"":`<small>К версии ${escapeHtml(a.previous_id)}</small>`}</div>
+    </div>
+    <p class="approval-check">${a.current?"Входные версии актуальны.":"Версии изменились. Требуется перерасчёт."} ${a.verified?"Построчная сверка пройдена.":"Расхождение при проверке расчёта."}</p>`;
+  if (director) {
+    return html+`<h3 class="sectionlabel">Заключение риск-менеджера</h3>
+      <p>${a.reviewed_by?`Версия ${escapeHtml(j.result)} согласована.`:"Согласование отсутствует."}</p>
+      <p class="muted">${a.comment?`Комментарий: ${escapeHtml(a.comment)}`:"Комментарий к согласованию не добавлен."}</p>
+      <p class="approval-note">После утверждения эта версия станет опубликованным результатом за ${escapeHtml(j.day)}.</p>`;
+  }
+  const sources = Object.entries(a.source_rows);
+  const formulas = {P1:"Сделки × Курсы + Справочник",P2:"|Сделки − Курсы| × Справочник"};
+  const formula = formulas[j.kind] || "Сумма входных значений + номер строки";
+  html+=`<h3 class="sectionlabel">Проверка синтетических данных</h3>
+    <p>Расчёт строки: (${formula}) × ${number.format(j.factor)}.</p>
+    ${table(["Строка",...sources.map(([k])=>state.labels[k]),"Результат, усл. ед."],
+      j.version.rows.map((v,i)=>[i+1,...sources.map(([,rows])=>number.format(rows[i])),number.format(v)]))}
+    <p class="approval-note">Входные версии: ${Object.entries(j.inputs).map(([k,v])=>`${state.labels[k]} — ${escapeHtml(v)}`).join("; ")}.</p>`;
+  return html;
+}
 function renderDetail() {
   const j = state.jobs.find((x) => x.id === selected);
   if (!j) {
@@ -237,6 +269,14 @@ function renderDetail() {
     return;
   }
   el("jobTitle").textContent = `RUN-${j.id} · ${state.catalog[j.kind]}`;
+  el("decision").hidden = !reviewRole() || j.status !== "review";
+  if (reviewRole()) {
+    el("jobBody").innerHTML = approvalView(j);
+    const approve = el("decision").querySelector('[data-decision="approve"]');
+    approve.textContent = state.role === "director" ? "Утвердить к публикации" : "Согласовать версию";
+    approve.disabled = !j.assessment?.current || !j.assessment?.verified;
+    return;
+  }
   const events = state.events.filter((e) => e.job === j.id);
   el("jobBody").innerHTML =
     `${badge(j)} <small>${j.day} · ${j.initiators.map(escapeHtml).join(", ")}</small>
@@ -255,7 +295,6 @@ function renderDetail() {
    events.map((e) => [e.seq, stamp(e.at), escapeHtml(e.message)]),
  )}
  ${state.role === "admin" && ["queued", "running"].includes(j.status) ? '<button class="danger sp" id="cancel">Отменить запуск</button>' : ""}`;
-  el("decision").hidden = !reviewRole() || j.status !== "review";
 }
 async function refresh() {
   const generation = ++revision;
@@ -264,7 +303,8 @@ async function refresh() {
   state = data;
   if (reviewRole()) tab = "review";
   else if (tab === "review") tab = "home";
-  el("connection").textContent = "● Система доступна";
+  el("connection").dataset.status = "online";
+  el("connection").textContent = "Система доступна";
   render();
 }
 async function act(fn) {
@@ -293,24 +333,11 @@ el("demo").onclick = () =>
     message("Партия №"+v.id+" · "+v.day);
   });
 el("openDemos").onclick = () => {
-  if (!state) {
-    message("Ожидаем подключение к серверу.");
-    return;
-  }
-  if (state.role === "admin") {
-    tab = "scenarios";
-    render();
-    el("scenario").focus();
-    return;
-  }
-  el("demoHint").textContent = "Демо-сценарии запускает администратор. Можно переключить учебную роль и выбрать сценарий.";
-  el("demoDialog").showModal();
-};
-el("enterDemos").onclick = () => act(async () => {
-  await api("role/admin", {});
+  if (state?.role !== "admin") return;
   tab = "scenarios";
-  el("demoDialog").close();
-});
+  render();
+  el("scenario").focus();
+};
 el("batch").onchange=()=>{batchId=Number(el("batch").value);render()};
 el("launch").onclick = () => {
   const f = el("launchForm").elements;
@@ -370,6 +397,7 @@ async function poll() {
   try {
     if (!busy) await refresh();
   } catch {
+    el("connection").dataset.status = "offline";
     el("connection").textContent = "Нет связи с сервером";
   } finally {
     setTimeout(poll, 600);

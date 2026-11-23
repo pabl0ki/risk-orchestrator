@@ -66,7 +66,7 @@ def read_inputs(s, req):
     return inputs
 
 
-from calculations import calculate
+from .calculations import calculate
 
 
 class Engine:

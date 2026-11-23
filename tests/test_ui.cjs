@@ -8,8 +8,12 @@ const assert = require("node:assert/strict");
 
 async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "risk-stage4-"));
-  const output = path.join(__dirname, "Демонстрация");
-  fs.mkdirSync(output, { recursive: true });
+  const root = path.resolve(__dirname, "..");
+  const output = process.env.TEST_OUTPUT || path.join(root, "Демонстрация");
+  const screenshots = path.join(output, "скриншоты");
+  const reports = path.join(output, "протоколы");
+  fs.mkdirSync(screenshots, { recursive: true });
+  fs.mkdirSync(reports, { recursive: true });
   const server = spawn(
     process.env.TEST_PYTHON || "python",
     [
@@ -22,7 +26,7 @@ async function main() {
       "--duration",
       "2",
     ],
-    { cwd: __dirname, windowsHide: true, stdio: ["ignore", "pipe", "inherit"] },
+    { cwd: root, windowsHide: true, stdio: ["ignore", "pipe", "inherit"] },
   );
   const exited = once(server, "exit");
   let browser;
@@ -47,7 +51,7 @@ async function main() {
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.goto(url);
-    await page.getByText("● Система доступна").waitFor();
+    await page.locator('#connection[data-status="online"]').waitFor();
     const snapshot = async () => await (await fetch(url + "/api/state")).json();
     await page.click("#demo");
     await page.getByText("Сделки · ожидает №1").first().waitFor();
@@ -58,7 +62,7 @@ async function main() {
     );
     assert.deepEqual(live.jobs[0].initiators, ["Анна", "Регламент"]);
     await page.screenshot({
-      path: path.join(output, "01 — Ожидание ресурса.png"),
+      path: path.join(screenshots, "01 — Ожидание ресурса.png"),
     });
     await page.click('[data-tab="timeline"]');
     await page.getByText("v3.1", { exact: true }).waitFor();
@@ -74,7 +78,7 @@ async function main() {
       ),
     );
     await page.screenshot({
-      path: path.join(output, "02 — Порядок выполнения.png"),
+      path: path.join(screenshots, "02 — Порядок выполнения.png"),
     });
     await page.selectOption("#role", "analyst");
     await page.getByRole("heading", { name: "Панель аналитика" }).waitFor();
@@ -83,14 +87,20 @@ async function main() {
     await page.getByText("Ожидает решения", { exact: true }).last().waitFor();
     await page.selectOption("#role", "reviewer");
     await page.locator('[data-job="4"]').first().click();
+    assert(await page.locator("#openDemos").isHidden());
+    await page.getByText("Проверка синтетических данных",{exact:true}).waitFor();
     await page.click('[data-decision="reject"]');
     await page.getByText("Укажите причину отклонения.").waitFor();
+    await page.fill("#comment","Проверены входы и строки версии v4.1");
     await page.click('[data-decision="approve"]');
     await page.waitForFunction(() => !document.querySelector("#details").open);
     assert.equal((await snapshot()).jobs[3].version.approval, "reviewed");
     await page.selectOption("#role", "director");
     await page.locator('[data-job="4"]').first().click();
     await page.fill("#comment", "Проверена версия v4.1");
+    assert(await page.locator("#openDemos").isHidden());
+    await page.getByText("Комментарий: Проверены входы и строки версии v4.1").waitFor();
+    await page.getByRole("button",{name:"Утвердить к публикации"}).waitFor();
     await page.click('[data-decision="approve"]');
     await page.waitForFunction(() => !document.querySelector("#details").open);
     await page.selectOption("#role", "admin");
@@ -117,7 +127,7 @@ async function main() {
       browserErrors: errors,
     };
     fs.writeFileSync(
-      path.join(output, "Протокол.json"),
+      path.join(reports, "Протокол.json"),
       JSON.stringify(report, null, 2),
     );
     console.log(JSON.stringify(report.sequence));
@@ -149,13 +159,13 @@ async function main() {
         assert(events.some(e=>e.job===ref.id && e.message.includes("Справочник · ожидает")));
         assert(jobs.filter(j=>j.parent===ref.id).every(j=>j.inputs.reference===ref.result));
       }
-      await page.screenshot({path:path.join(output,key+".png"),fullPage:true});
+      await page.screenshot({path:path.join(screenshots,key+".png"),fullPage:true});
       scenarios.push({scenario:key,requests,runs:count,events});
     }
     await page.selectOption("#batch","1");
     await page.getByRole("heading",{name:"Чтение и запись"}).waitFor();
     assert.deepEqual(errors, []);
-    fs.writeFileSync(path.join(output,"Сценарии.json"),JSON.stringify(scenarios,null,2));
+    fs.writeFileSync(path.join(reports,"Сценарии.json"),JSON.stringify(scenarios,null,2));
   } finally {
     if (browser) await browser.close();
     server.kill();
