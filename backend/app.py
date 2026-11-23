@@ -10,11 +10,13 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
-from engine import CATALOG, LABELS, Engine
-from scenarios import SCENARIOS, launch_batch
-from worker import run_worker
+from .engine import CATALOG, LABELS, Engine
+from .calculations import calculate
+from .scenarios import SCENARIOS, launch_batch
+from .worker import run_worker
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
+FRONTEND = ROOT / "frontend"
 USERS = {"admin": "Оператор", "analyst": "Анна", "reviewer": "Риск-менеджер", "director": "Директор"}
 
 
@@ -70,6 +72,22 @@ def create_app(database, duration):
             jobs = [j for j in jobs if j["status"] == "review" and snapshot["results"][j["result"]]["approval"] == stage]
         ids = {j["id"] for j in jobs}
         for j in jobs:
+            if role(request) in ("reviewer", "director"):
+                version = snapshot["results"][j["result"]]
+                rows = version["rows"]
+                previous = snapshot["results"].get(version.get("previous"))
+                review = next((sig for sig in snapshot["signals"].values()
+                               if sig[:3] == [j["id"], "approve", "Риск-менеджер"]), None)
+                j["assessment"] = dict(total=sum(rows), count=len(rows),
+                    previous_id=previous["id"] if previous else None,
+                    previous_total=sum(previous["rows"]) if previous else None,
+                    verified=calculate(j) == rows,
+                    current=engine.fresh(snapshot,j,version) and
+                            snapshot["heads"].get(version["object"]+"/"+j["day"]) == version.get("previous"),
+                    reviewed_by=review[2] if review else None,
+                    comment=review[4] if review and len(review)>4 else "")
+                if role(request) == "reviewer":
+                    j["assessment"]["source_rows"] = {k:v["rows"] for k,v in j["inputs"].items()}
             j.pop("token")
             j["inputs"] = {k:v["id"] for k,v in j["inputs"].items()}
             j["version"] = snapshot["results"].get(j["result"], {}).copy()
@@ -108,20 +126,20 @@ def create_app(database, duration):
 
     @api.get("/")
     def index():
-        return FileResponse(ROOT / "index.html")
+        return FileResponse(FRONTEND / "index.html")
 
     @api.get("/{asset}")
     def asset(asset: str):
         if asset not in ("app.js","style.css"):
             raise HTTPException(404)
-        return FileResponse(ROOT / asset)
+        return FileResponse(FRONTEND / asset)
 
     return api
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db", default=str(ROOT / "stage4.sqlite3"))
+    parser.add_argument("--db", default=str(ROOT / "data" / "stage4.sqlite3"))
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--duration", type=float, default=4)
     parser.add_argument("--open", action="store_true")

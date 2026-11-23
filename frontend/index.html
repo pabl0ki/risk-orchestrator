@@ -12,9 +12,8 @@
       <nav id="nav" aria-label="Разделы"></nav>
       <div class="right">
         <span id="connection" class="online" role="status">Подключение…</span>
-        <label class="role"
-          >Роль
-          <select id="role">
+        <label class="role" for="role"><span>Роль</span>
+          <select id="role" aria-label="Рабочая роль">
             <option value="admin">Администратор</option>
             <option value="analyst">Аналитик</option>
             <option value="reviewer">Риск-менеджер</option>
@@ -27,9 +26,9 @@
       <div class="head">
         <h1 id="heading">Системная панель</h1>
         <div class="tools">
-          <button id="openDemos" aria-haspopup="dialog">Демо-сценарии</button>
-          <select id="scenario" aria-label="Сценарий для запуска"></select>
-          <button id="demo">Запустить демо</button>
+          <button id="openDemos" hidden>Демо-сценарии</button>
+          <select id="scenario" hidden aria-label="Сценарий для запуска"></select>
+          <button id="demo" hidden>Запустить демо</button>
           <button id="launch" class="primary">＋ Запустить процесс</button>
         </div>
       </div>
@@ -37,16 +36,6 @@
       <label id="history" hidden>История демонстраций <select id="batch"></select></label>
       <section id="view" class="panel"></section>
     </main>
-    <dialog id="demoDialog" aria-labelledby="demoTitle">
-      <div class="dialogtitle">
-        <h2 id="demoTitle">Демо-сценарии</h2>
-        <button data-close aria-label="Закрыть">×</button>
-      </div>
-      <p id="demoHint"></p>
-      <div class="actions">
-        <button id="enterDemos" class="primary">Перейти как администратор</button>
-      </div>
-    </dialog>
     <dialog id="formDialog">
       <form id="launchForm">
         <h2>Запустить процесс</h2>

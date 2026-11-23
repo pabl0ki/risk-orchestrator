@@ -17,4 +17,4 @@ if __name__ == "__main__":
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", "--target", str(libraries),
                         "-r", str(ROOT / "requirements.txt")], check=True)
-    runpy.run_path(str(ROOT / "app.py"), run_name="__main__")
+    runpy.run_module("backend.app", run_name="__main__", alter_sys=True)
