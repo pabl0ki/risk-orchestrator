@@ -69,6 +69,11 @@ def read_inputs(s, req):
 from .calculations import calculate
 
 
+def output_key(job):
+    name, scope, _ = next(resource for resource in job["resources"] if resource[2] == "W")
+    return f"{name}/{scope}"
+
+
 class Engine:
     def __init__(self, db):
         self.db = str(db)
@@ -195,10 +200,10 @@ class Engine:
                 raise ValueError("Решение не соответствует этапу или версии.")
             if decision == "reject" and not comment.strip():
                 raise ValueError("Укажите причину отклонения.")
-            target = v["object"] + "/" + j["day"]
             if decision == "approve":
-                if not self.fresh(s, j, v) or s["heads"].get(target) != v["previous"]:
-                    raise ValueError("Входы или опубликованная версия изменились. Требуется перерасчёт.")
+                checks = self.approval_checks(s, j, v)
+                if checks["block_reason"]:
+                    raise ValueError(checks["block_reason"])
             if decision == "approve" and actor == "Риск-менеджер":
                 v["approval"] = "reviewed"
                 j["reason"] = "Ожидает утверждения директора"
@@ -206,20 +211,49 @@ class Engine:
                 s["signals"][event_id] = [jid, decision, actor, None, comment, version]
                 return None
             if decision == "approve":
-                s["heads"][target] = v["id"]
+                s["heads"][output_key(j)] = v["id"]
+                self.invalidate_approvals(s)
             j.update(status="done" if decision=="approve" else "rejected", end=now(), reason="")
             v["approval"] = "approved" if decision=="approve" else "rejected"
             successor = None
             if decision == "reject":
                 successor = self.add(s,dict(kind=j["kind"],day=j["day"],factor=j["factor"],actor=j["actor"],
                     shared=any(x[0]=="work" for x in j["resources"]),rerun=True,approval=True,parent=j["parent"]))
+                for batch in s.get("demo_batches", []):
+                    if jid in batch["jobs"]:
+                        batch["jobs"].append(successor)
+                        batch["requests"] += 1
+                        break
             s["signals"][event_id]=[jid,decision,actor,successor,comment,version]
             event(s,jid,actor + (" · согласовано " if decision=="approve" else " · отклонено ") + v["id"] + " · " + comment)
+            if successor:
+                event(s, jid, f"Создан перерасчёт RUN-{successor} для версии {v['id']}")
+                event(s, successor, f"Перерасчёт RUN-{jid} (версия {v['id']}) · {comment}")
             return successor
 
     def fresh(self, s, job, version):
         current = read_inputs(s,job)
         return all(current[k]["id"] == v for k,v in version["inputs"].items())
+
+    def approval_checks(self, state, job, version):
+        reasons = []
+        inputs = read_inputs(state, job)
+        for name, used in version["inputs"].items():
+            latest = inputs[name]["id"]
+            if used != latest:
+                reasons.append(f"Изменился вход «{LABELS[name]}»: в расчёте — {used}, сейчас — {latest}.")
+        previous = version.get("previous")
+        published = state["heads"].get(output_key(job))
+        if previous != published:
+            reasons.append(f"Изменилась публикация «{LABELS[version['object']]}»: "
+                           f"при расчёте — {previous or 'ещё не опубликовано'}, "
+                           f"сейчас — {published or 'нет публикации'}.")
+        current = not reasons
+        verified = calculate(job) == version["rows"]
+        if not verified:
+            reasons.append("Построчная сверка выявила расхождение.")
+        reason = " ".join([*reasons, "Требуется перерасчёт."]) if reasons else ""
+        return dict(current=current, verified=verified, block_reason=reason)
 
     def schedule(self, data):
         with self.tx() as s:
@@ -256,32 +290,37 @@ class Engine:
                         j.update(status="rejected", end=t, reason="Предшественник завершился без результата")
                         event(s, j["id"], j["reason"])
                     else:
-                        self.wait(s, j, "Ожидание предшественника №" + str(parent["id"]))
+                        self.wait(s, j, "Ожидание предшественника №" + str(parent["id"]), parent["id"])
                     continue
                 reason = ""
+                blocker = None
                 for owner in active + protected:
                     obj = collision(j["resources"], owner["resources"])
                     if obj:
                         reason = f"{obj} · ожидает №{owner['id']}"
+                        blocker = owner["id"]
                         break
                 if reason or len(active) >= SLOTS:
-                    self.wait(s, j, reason or "Все исполнители заняты")
+                    self.wait(s, j, reason or "Все исполнители заняты", blocker)
                     if t-j["created"] >= PROTECT:
                         protected.append(j)
                     continue
                 inputs = j["inputs"] or read_inputs(s, j)
                 if parent:
                     pv = s["results"][parent["result"]]
-                    if pv["object"] in inputs:
+                    parent_scope = output_key(parent)
+                    if any(mode == "R" and f"{name}/{scope}" == parent_scope
+                           for name, scope, mode in j["resources"]):
                         inputs[pv["object"]] = pv
                 j.update(status="running", start=t, token=uuid.uuid4().hex, lease=t+LEASE,
-                         inputs=inputs, attempt=j["attempt"]+1, reason="")
+                         inputs=inputs, attempt=j["attempt"]+1, reason="", wait_for=None)
                 event(s, j["id"], f"Допуск · попытка {j['attempt']} · получены все ресурсы")
                 active.append(j)
                 started.append(j.copy())
         return started
 
-    def wait(self, s, job, reason):
+    def wait(self, s, job, reason, blocker=None):
+        job["wait_for"] = blocker
         if job["reason"] != reason:
             job["reason"] = reason
             event(s, job["id"], reason)
@@ -291,6 +330,12 @@ class Engine:
         j.update(status="queued" if retry else "failed", token=None, lease=0,
                  reason=reason, end=None if retry else now())
         event(s, j["id"], reason + (" · назначен повтор" if retry else " · исчерпаны попытки"))
+
+    def execution_error(self, jid, token, error):
+        with self.tx() as s:
+            job = s["jobs"][jid-1]
+            if job["status"] == "running" and job["token"] == token and job["lease"] > now():
+                self.fail(s, job, f"Ошибка исполнения: {type(error).__name__}: {error}")
 
     def heartbeat(self, jid, token):
         with self.tx() as s:
@@ -308,25 +353,30 @@ class Engine:
                 return rid
             if j["status"] != "running" or j["token"] != token or j["lease"] <= now():
                 return None
-            target, day, _ = next(x for x in j["resources"] if x[2]=="W")
+            key = output_key(j)
+            target, scope = key.split("/", 1)
             s["results"][rid] = dict(id=rid, rows=rows, object=target, token=token,
-                previous=s["heads"].get(target+"/"+day),
+                scope=scope, previous=s["heads"].get(key),
                 inputs={k:v["id"] for k,v in j["inputs"].items()}, algorithm="demo-1", factor=j["factor"])
             review = j.get("approval",False)
             if not review:
-                s["heads"][target+"/"+day] = rid
+                s["heads"][key] = rid
             s["results"][rid]["approval"] = "pending" if review else "unused"
             j.update(status="review" if review else "done", end=now(), calculated_at=now(),
                      result=rid, token=None, reason="")
             event(s, jid, ("Передано на согласование " if review else "Опубликовано ") + rid + " · ресурсы освобождены")
-            for item in s["jobs"]:
-                if not item.get("approval") or not item.get("result"):
-                    continue
-                v = s["results"][item["result"]]
-                if v["approval"] == "approved" and not self.fresh(s,item,v):
-                    v["approval"] = "stale"
-                    event(s,item["id"],"Согласование устарело · изменён вход версии " + v["id"])
+            if not review:
+                self.invalidate_approvals(s)
             return rid
+
+    def invalidate_approvals(self, s):
+        for item in s["jobs"]:
+            if not item.get("approval") or not item.get("result"):
+                continue
+            v = s["results"][item["result"]]
+            if v["approval"] == "approved" and not self.fresh(s,item,v):
+                v["approval"] = "stale"
+                event(s,item["id"],"Согласование устарело · изменён вход версии " + v["id"])
 
     def control(self, jid, action):
         with self.tx() as s:

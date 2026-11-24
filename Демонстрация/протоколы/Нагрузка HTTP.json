@@ -1,0 +1,20 @@
+{
+  "utc": "2026-11-24T20:54:37.480327+00:00",
+  "endpoint": "POST /api/run",
+  "concurrent_clients": 100,
+  "business_dates": 20,
+  "requests_per_date": 5,
+  "simulated_duration_s": 3,
+  "successful_responses": 100,
+  "executions": 20,
+  "merged": 80,
+  "completed_calculations": 20,
+  "final_status": "review",
+  "peak_running": 4,
+  "registration_batch_ms": 222.5,
+  "latency_ms": {
+    "median": 135.4,
+    "p95": 206.4,
+    "maximum": 219.9
+  }
+}

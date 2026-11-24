@@ -67,6 +67,11 @@ function table(cols, rows) {
 }
 const jobLink = (j) =>
   `<button class="link id" data-job="${j.id}">RUN-${j.id}</button>`;
+function waitingReason(job, reason) {
+  const text = escapeHtml(reason);
+  if (job.status !== "queued" || !state.jobs.some(j => j.id === job.wait_for)) return text;
+  return `<button class="link wait-link" data-job="${job.wait_for}" title="Открыть RUN-${job.wait_for}">${text}</button>`;
+}
 const badge = (j) =>
   `<span class="tag ${j.status === "review" ? "waiting_external" : j.status}">${labels[j.status]}</span>`;
 let batchId=0;
@@ -93,12 +98,12 @@ function showScenario(batch){
   for(const e of events){
     if(/ожидает №|Ожидание предшественника|Все исполнители заняты/.test(e.message))reasons.set(e.job,e.message);
   }
-  const done=jobs.filter(j=>j.status==="done").length;
+  const done=jobs.filter(j=>["done","rejected","failed","cancelled"].includes(j.status)).length;
   const rows=jobs.map(j=>{
     const finishAt=finish(j)||end;
     const execution=j.start?`<i class="execution" style="left:${pct(j.start)}%;width:${Math.max(0,pct(finishAt)-pct(j.start))}%"></i>`:"";
     const bar=`<div class="interval" aria-hidden="true"><i class="waiting" style="left:${pct(j.created)}%;width:${Math.max(0,pct(j.start||finishAt)-pct(j.created))}%"></i>${execution}</div>`;
-    return [jobLink(j),state.catalog[j.kind],j.day,badge(j),j.parent?"RUN-"+j.parent:"—",bar,escapeHtml(j.status==="queued"?j.reason:reasons.get(j.id)||"—"),j.result||"—"];
+    return [jobLink(j),state.catalog[j.kind],j.day,badge(j),j.parent?"RUN-"+j.parent:"—",bar,waitingReason(j,j.status==="queued"?j.reason:reasons.get(j.id)||"—"),j.result||"—"];
   });
   return `<div class="pad"><h2>${state.scenarios[batch.scenario][0]}</h2><p class="lead">${state.scenarios[batch.scenario][1]}</p>
     <p class="batchstats">Заявки <b>${batch.requests}</b> · Запуски <b>${jobs.length}</b> · В очереди <b>${jobs.filter(j=>j.status==="queued").length}</b> · Выполняются <b>${jobs.filter(j=>j.status==="running").length}</b> · Завершены <b>${done}/${jobs.length}</b></p>
@@ -216,7 +221,7 @@ function render() {
           j.day,
           j.initiators.map(escapeHtml).join(", "),
           badge(j),
-          escapeHtml(
+          waitingReason(j,
             j.reason ||
               {
                 pending: "Согласование риск-менеджера",
@@ -245,7 +250,7 @@ function approvalView(j) {
       ${measure("Обработано строк")}<b>${a.count}</b></div>
       ${measure("Изменение к предыдущей публикации")}<b>${delta===null?"Первая публикация":(delta>0?"+":"")+number.format(delta)+" усл. ед."}</b>${delta===null?"":`<small>К версии ${escapeHtml(a.previous_id)}</small>`}</div>
     </div>
-    <p class="approval-check">${a.current?"Входные версии актуальны.":"Версии изменились. Требуется перерасчёт."} ${a.verified?"Построчная сверка пройдена.":"Расхождение при проверке расчёта."}</p>`;
+    <p class="approval-check">${escapeHtml(a.block_reason || "Входные версии актуальны. Построчная сверка пройдена.")}</p>`;
   if (director) {
     return html+`<h3 class="sectionlabel">Заключение риск-менеджера</h3>
       <p>${a.reviewed_by?`Версия ${escapeHtml(j.result)} согласована.`:"Согласование отсутствует."}</p>
@@ -270,15 +275,18 @@ function renderDetail() {
   }
   el("jobTitle").textContent = `RUN-${j.id} · ${state.catalog[j.kind]}`;
   el("decision").hidden = !reviewRole() || j.status !== "review";
+  const related = (id) => state.jobs.some(job => job.id === id) ? jobLink({id}) : `RUN-${id}`;
+  const links = (j.rerun_from ? `<p>Перерасчёт для ${related(j.rerun_from)}</p>` : "") +
+    (j.rerun_to ? `<p>Возвращён на перерасчёт → ${related(j.rerun_to)}</p>` : "");
   if (reviewRole()) {
-    el("jobBody").innerHTML = approvalView(j);
+    el("jobBody").innerHTML = links + approvalView(j);
     const approve = el("decision").querySelector('[data-decision="approve"]');
     approve.textContent = state.role === "director" ? "Утвердить к публикации" : "Согласовать версию";
-    approve.disabled = !j.assessment?.current || !j.assessment?.verified;
+    approve.disabled = !j.assessment || Boolean(j.assessment.block_reason);
     return;
   }
   const events = state.events.filter((e) => e.job === j.id);
-  el("jobBody").innerHTML =
+  el("jobBody").innerHTML = links +
     `${badge(j)} <small>${j.day} · ${j.initiators.map(escapeHtml).join(", ")}</small>
  <h3 class="sectionlabel">Версия и результат</h3><p>${j.result ? escapeHtml(j.result) + " · " + j.version.rows.join(" · ") : "Расчёт ещё не завершён"}</p>
  <p class="muted">${Object.values(j.inputs).map(escapeHtml).join(" · ")}</p>
@@ -303,13 +311,15 @@ async function refresh() {
   state = data;
   if (reviewRole()) tab = "review";
   else if (tab === "review") tab = "home";
-  el("connection").dataset.status = "online";
-  el("connection").textContent = "Система доступна";
+  el("connection").dataset.status = data.worker_alive ? "online" : "degraded";
+  el("connection").textContent = data.worker_alive
+    ? "Система доступна" : "Сервер доступен, обработка очереди остановлена";
   render();
 }
 async function act(fn) {
   if (busy) return;
   busy = true;
+  el("role").disabled = true;
   revision++;
   try {
     await fn();
@@ -318,6 +328,7 @@ async function act(fn) {
     message(e.message);
   } finally {
     busy = false;
+    el("role").disabled = false;
   }
 }
 el("role").onchange = () =>
@@ -383,14 +394,16 @@ document.addEventListener("click", (e) => {
   if (b.dataset.decision)
     act(async () => {
       const j = state.jobs.find((x) => x.id === selected);
-      await api(`jobs/${selected}/decision`, {
+      const result = await api(`jobs/${selected}/decision`, {
         decision: b.dataset.decision,
         version: j.result,
         key: crypto.randomUUID(),
         comment: el("comment").value,
       });
       el("details").close();
-      message("Решение зарегистрировано");
+      message(result.successor
+        ? `RUN-${j.id} возвращён на перерасчёт. Создан RUN-${result.successor}.`
+        : "Решение зарегистрировано");
     });
 });
 async function poll() {

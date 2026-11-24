@@ -13,7 +13,10 @@ def execute(engine, job, duration):
         time.sleep(min(1, max(0, deadline - time.monotonic())))
         if not engine.heartbeat(job["id"], job["token"]):
             return
-    engine.publish(job["id"], job["token"], calculate(job))
+    try:
+        engine.publish(job["id"], job["token"], calculate(job))
+    except Exception as error:
+        engine.execution_error(job["id"], job["token"], error)
 
 
 def run_worker(database, duration, stop):

@@ -48,6 +48,27 @@ class Orchestration(unittest.TestCase):
         reader,=self.e.claim()
         self.assertEqual(reader["inputs"]["reference"]["id"],"v1.1")
 
+    def test_dependency_previous_day_keeps_child_partition(self):
+        parent = self.add("Z1", day="2026-11-22")
+        self.add("P1", day="2026-11-23", parent=parent)
+        writer, = self.e.claim()
+        self.finish(writer)
+        child, = self.e.claim()
+        self.assertEqual(child["inputs"]["deals"]["id"], "base/deals/2026-11-23")
+
+    def test_executor_records_calculation_exception(self):
+        from unittest.mock import patch
+        from backend.worker import execute
+
+        jid = self.add()
+        with patch("backend.worker.calculate", side_effect=ValueError("invalid input")):
+            for _ in range(2):
+                job, = self.e.claim()
+                execute(self.e, job, 0)
+        snapshot = self.e.snapshot()
+        self.assertEqual(snapshot["jobs"][jid-1]["status"], "failed")
+        self.assertIn("ValueError: invalid input", snapshot["events"][-1]["message"])
+
     def test_T5_complete_input(self):
         self.add("Z1"); self.add()
         writer,=self.e.claim()
@@ -158,6 +179,46 @@ class Orchestration(unittest.TestCase):
         successor = self.e.decide(jid,"reject","Риск-менеджер","no","Требуется проверка")
         self.assertEqual(successor,2)
         self.assertTrue(self.e.snapshot()["jobs"][1]["rerun"])
+        before = self.e.snapshot()
+        self.assertTrue(any(e["job"] == jid and "RUN-2" in e["message"] for e in before["events"]))
+        self.assertTrue(any(e["job"] == successor and "RUN-1" in e["message"] for e in before["events"]))
+        self.assertEqual(self.e.decide(jid,"reject","Риск-менеджер","no","Требуется проверка"), successor)
+        self.assertEqual(self.e.snapshot()["events"], before["events"])
+
+    def test_approved_reference_is_global(self):
+        self.add("FX")
+        initial, = self.e.claim()
+        old = self.finish(initial)
+        jid = self.add("FX", approval=True)
+        candidate, = self.e.claim()
+        new = self.finish(candidate)
+        self.e.decide(jid, "approve", "Риск-менеджер", "review", version=new)
+        self.assertEqual(self.e.snapshot()["heads"], {"reference/*": old})
+        self.e.decide(jid, "approve", "Директор", "sign", version=new)
+        self.assertEqual(self.e.snapshot()["heads"], {"reference/*": new})
+        self.add(day="2027-01-01")
+        consumer, = self.e.claim()
+        self.assertEqual(consumer["inputs"]["reference"]["id"], new)
+
+    def test_row_mismatch_blocks_each_decision(self):
+        jid = self.add(approval=True)
+        job, = self.e.claim()
+        rid = self.finish(job)
+        for actor in ("Риск-менеджер", "Директор"):
+            with self.subTest(actor=actor):
+                with self.e.tx() as state:
+                    state["results"][rid]["rows"][0] += 1
+                state = self.e.snapshot()
+                checks = self.e.approval_checks(state, state["jobs"][jid-1], state["results"][rid])
+                self.assertTrue(checks["current"])
+                self.assertFalse(checks["verified"])
+                with self.assertRaisesRegex(ValueError, "Построчная сверка") as error:
+                    self.e.decide(jid, "approve", actor, actor, version=rid)
+                self.assertEqual(str(error.exception), checks["block_reason"])
+                self.assertFalse(self.e.snapshot()["heads"])
+                with self.e.tx() as state:
+                    state["results"][rid]["rows"][0] -= 1
+                self.e.decide(jid, "approve", actor, actor, version=rid)
 
     def test_two_stage_publication(self):
         jid = self.add(approval=True)
@@ -179,9 +240,14 @@ class Orchestration(unittest.TestCase):
         self.add(rerun=True)
         newer, = self.e.claim()
         published = self.finish(newer)
-        with self.assertRaises(ValueError):
+        self.add("FX")
+        writer, = self.e.claim()
+        ref = self.finish(writer)
+        with self.assertRaises(ValueError) as error:
             self.e.decide(jid,"approve","Директор","late")
-        self.assertEqual(list(self.e.snapshot()["heads"].values()),[published])
+        self.assertIn(f"«Справочник»: в расчёте — base/reference/*, сейчас — {ref}", str(error.exception))
+        self.assertIn(f"«Кредитный результат»: при расчёте — ещё не опубликовано, сейчас — {published}", str(error.exception))
+        self.assertEqual(self.e.snapshot()["heads"]["credit/"+DAY],published)
 
     def test_T15_route_revision(self):
         self.add()
