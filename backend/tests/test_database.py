@@ -1,5 +1,5 @@
 import pytest
-from backend.database import OrchestratorDB
+from backend.database.connection import OrchestratorDB
 
 @pytest.fixture
 def db():

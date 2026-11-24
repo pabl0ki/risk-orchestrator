@@ -14,10 +14,10 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
-from .engine import CATALOG, LABELS, Engine
-from .calculations import calculate
-from .scenarios import SCENARIOS, launch_batch
-from .worker import run_worker
+from backend.orchestrator.engine import CATALOG, LABELS, Engine
+from backend.orchestrator.calculations import calculate
+from backend.orchestrator.scenarios import SCENARIOS, launch_batch
+from backend.orchestrator.worker import run_worker
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"

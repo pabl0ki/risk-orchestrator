@@ -3,8 +3,8 @@ import time
 from multiprocessing import parent_process
 from concurrent.futures import ThreadPoolExecutor
 
-from .engine import Engine, SLOTS
-from .calculations import calculate
+from backend.orchestrator.engine import Engine, SLOTS
+from backend.orchestrator.calculations import calculate
 
 
 def execute(engine, job, duration):
