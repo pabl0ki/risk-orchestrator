@@ -180,7 +180,25 @@ async function main() {
     await page.click("#demo");
     const reviewBatch = await (await launched).json();
     const [original, reference] = reviewBatch.jobs;
+    const oldRun = page.locator(`#view [data-job="${original}"]`).first();
+    await oldRun.waitFor();
+    let resumeSwitch;
+    const holdSwitch = new Promise(resolve => { resumeSwitch = resolve; });
+    await page.route("**/api/role/reviewer", async route => {
+      await holdSwitch;
+      await route.continue();
+    }, { times: 1 });
     await page.selectOption("#role","reviewer");
+    try {
+      const bounds = await oldRun.boundingBox();
+      assert(bounds);
+      await page.mouse.click(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+      assert.equal(await page.locator("#details").evaluate(dialog => dialog.open), false,
+        "A run from the previous role must not open during a role switch");
+    } finally {
+      resumeSwitch();
+    }
+    await page.locator('[data-tab="review"][aria-current="page"]').waitFor();
     await page.locator(`[data-job="${original}"]`).first().click();
     await page.getByText(new RegExp("Изменился вход «Справочник».*v"+reference+"\\.1")).waitFor();
     assert(await page.locator('[data-decision="approve"]').isDisabled());

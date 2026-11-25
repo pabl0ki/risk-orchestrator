@@ -331,11 +331,21 @@ async function act(fn) {
     el("role").disabled = false;
   }
 }
-el("role").onchange = () =>
-  act(async () => {
-    await api("role/" + el("role").value, {});
-    tab = "home";
-  });
+el("role").onchange = async () => {
+  const content = document.querySelector("main");
+  content.inert = true;
+  el("nav").inert = true;
+  try {
+    await act(async () => {
+      await api("role/" + el("role").value, {});
+      tab = "home";
+    });
+  } finally {
+    if (state) el("role").value = state.role;
+    content.inert = false;
+    el("nav").inert = false;
+  }
+};
 el("demo").onclick = () =>
   act(async () => {
     const v = await api("demo?scenario="+encodeURIComponent(el("scenario").value), {});
