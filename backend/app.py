@@ -120,7 +120,10 @@ def create_app(database, duration):
             j["inputs"] = {k:v["id"] for k,v in j["inputs"].items()}
             j["version"] = snapshot["results"].get(j["result"], {}).copy()
             j["version"].pop("token", None)
-            j["initiators"] = [r["actor"] for r in snapshot["requests"] if r["job"] == j["id"]]
+            actors = [r["actor"] for r in snapshot["requests"] if r["job"] == j["id"]]
+            j["initiators"] = [j["actor"]]
+            j["subscribers"] = list(dict.fromkeys(actor for actor in actors if actor != j["actor"]))
+            j["request_count"] = len(actors)
         return dict(jobs=jobs, role=role(request), worker_alive=request.app.state.worker.is_alive(),
                     catalog={k:v[0] for k,v in CATALOG.items()},
                     scenarios=SCENARIOS if role(request)=="admin" else {},
@@ -163,6 +166,18 @@ def create_app(database, duration):
         if asset not in ("app.js","style.css"):
             raise HTTPException(404)
         return FileResponse(FRONTEND / asset)
+
+    @api.post("/api/external-events")
+    def external_event(request: Request, data: dict):
+        """Принимает внешнее событие (согласование/утверждение)."""
+        actor = require(request, "reviewer", "director")
+        if not all(k in data for k in ("run_id", "decision")):
+            raise ValueError("Нужны run_id и decision.")
+        return engine.decide(
+            data["run_id"], data["decision"], actor,
+            data.get("event_id", uuid.uuid4().hex),
+            data.get("comment", ""), data.get("version")
+        )
 
     return api
 

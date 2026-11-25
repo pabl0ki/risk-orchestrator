@@ -43,31 +43,6 @@ class OrchestratorDB:
             state["events"] = [json.loads(item[0]) for item in events]
         return state, row[0] if row else None, legacy_journal
 
-    def snapshot(self):
-        self.conn.execute("BEGIN")
-        with self.conn:
-            state, _, _ = self._read_state()
-            return state
-
-    @contextmanager
-    def state_transaction(self):
-        self.conn.execute("BEGIN IMMEDIATE")
-        with self.conn:
-            state, original, legacy = self._read_state()
-            # Old ledger files keep their journal inside the state until the first commit.
-            existing = 0 if legacy else len(state.get("events", []))
-            yield state
-            events = state.get("events", [])
-            for entry in events[existing:]:
-                self.conn.execute(queries.INSERT_EVENT, (
-                    datetime.fromtimestamp(entry["at"]).isoformat(), "orchestrator.operation",
-                    "run", entry["job"], json.dumps(entry, ensure_ascii=False), "system",
-                ))
-            payload = json.dumps({k: v for k, v in state.items() if k != "events"},
-                                 ensure_ascii=False, separators=(",", ":"))
-            if payload != original:
-                self.conn.execute("INSERT OR REPLACE INTO ledger (id,payload) VALUES (1,?)", (payload,))
-
     # --- Справочники ---
 
     def create_business_process(self, name: str, risk_type: str, route: dict) -> int:
@@ -100,6 +75,24 @@ class OrchestratorDB:
             queries.UPDATE_BUSINESS_PROCESS,
             (name, risk_type, json.dumps(route), bp_id),
         )
+
+    def get_business_process_by_name(self, name: str) -> dict | None:
+        """Находит бизнес-процесс по имени."""
+        return self.conn.execute(
+            "SELECT * FROM business_process WHERE name = ?", (name,)
+        ).fetchone()
+
+    def create_stage(self, bp_id: int, stage_type: str, required_resources: str, 
+                    depends_on_stages: str | None, avg_duration: int, priority: int) -> int:
+        """Создаёт этап для бизнес-процесса."""
+        cursor = self.conn.execute(
+            """INSERT INTO stage (business_process_id, name, stage_type, required_resources, 
+            depends_on_stages, avg_duration, priority_default)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (bp_id, f"Этап {stage_type}", stage_type, required_resources, 
+            depends_on_stages, avg_duration, priority)
+        )
+        return cursor.lastrowid
 
     # --- Заявки на бизнес-процессы ---
 
@@ -138,6 +131,14 @@ class OrchestratorDB:
                 (bp_id, date, input_hash),
             ).fetchone()
             return {"status": "merged", "id": existing["bp_request_id"], "merged": True}
+
+    def get_all_bp_requests(self) -> list[dict]:
+        """Возвращает все заявки на бизнес-процессы."""
+        return self.conn.execute("""
+            SELECT bp_request_id, business_process_id, date, initiator_type, initiator_id, input_hash
+            FROM bp_request
+            ORDER BY submitted_at DESC
+        """).fetchall()
 
     # --- Заявки на этапы ---
 
@@ -218,6 +219,23 @@ class OrchestratorDB:
         return self.conn.execute(
             queries.GET_STALE_RUNS, (f"-{threshold_seconds} seconds",)
         ).fetchall()
+
+    def get_all_runs_with_context(self) -> list[dict]:
+        """Возвращает все запуски с контекстом (bp_name, date, required_resources и т.д.)."""
+        return self.conn.execute("""
+            SELECT r.run_id, r.status AS run_status, r.created_at, r.started_at, r.finished_at,
+                r.heartbeat_at, r.lease_expires_at, r.parent_run_id, r.result_payload,
+                sr.date, sr.stage_id, sr.waiting_for,
+                s.stage_type, s.required_resources, s.business_process_id,
+                bp.name AS bp_name, bp.risk_type,
+                br.initiator_type, br.initiator_id
+            FROM run r
+            JOIN stage_request sr ON r.stage_request_id = sr.stage_request_id
+            JOIN stage s ON sr.stage_id = s.stage_id
+            JOIN business_process bp ON s.business_process_id = bp.business_process_id
+            JOIN bp_request br ON sr.bp_request_id = br.bp_request_id
+            ORDER BY r.created_at DESC
+        """).fetchall()
 
     # --- Блокировки ---
 
@@ -381,12 +399,6 @@ class OrchestratorDB:
 
     def get_bp_request_full(self, bp_request_id: int) -> list[dict]:
         return self.conn.execute(queries.GET_BP_REQUEST_FULL, (bp_request_id,)).fetchall()
-
-    def get_queue_snapshot(self) -> list[dict]:
-        return self.conn.execute(queries.GET_QUEUE_SNAPSHOT).fetchall()
-
-    def get_locks_snapshot(self) -> list[dict]:
-        return self.conn.execute(queries.GET_LOCKS_SNAPSHOT).fetchall()
 
     # --- Закрытие ---
 

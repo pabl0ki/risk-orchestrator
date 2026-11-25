@@ -61,7 +61,8 @@ def run(url):
     latencies = sorted(ms for _, _, ms in responses)
     for group in range(GROUPS):
         assert len({jid for g, jid, _ in responses if g == group}) == 1, "Дубли разошлись"
-    assert len(jobs) == GROUPS and all(len(j["initiators"]) == COPIES for j in jobs)
+    assert len(jobs) == GROUPS and all(j["request_count"] == COPIES for j in jobs)
+    assert all(j["initiators"] == [j["actor"]] and not j["subscribers"] for j in jobs)
     # Считаем пересечение интервалов по серверным отметкам, включая короткие пики между опросами.
     peak = max(sum(j["start"] <= other["start"] < j["calculated_at"] for j in jobs)
                for other in jobs)

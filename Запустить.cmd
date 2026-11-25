@@ -1,5 +1,9 @@
 @echo off
 cd /d "%~dp0"
+if exist ".venv\Scripts\python.exe" (
+  ".venv\Scripts\python.exe" start.py --open
+  goto done
+)
 where py >nul 2>&1
 if not errorlevel 1 (
   py -3 start.py --open
