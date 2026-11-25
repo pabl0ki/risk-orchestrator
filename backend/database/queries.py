@@ -47,7 +47,8 @@ INSERT_BP_REQUEST = """
 
 GET_BP_REQUEST_BY_HASH = """
     SELECT bp_request_id, status FROM bp_request 
-    WHERE business_process_id=? AND date=? AND input_hash=?
+    WHERE business_process_id=? AND date=? AND input_hash=? AND merged_into_bp_request_id IS NULL
+    ORDER BY bp_request_id DESC
 """
 
 # --- Заявки на этапы ---
@@ -153,8 +154,8 @@ GET_RUNS_WAITING_EXTERNAL = """
 
 CHECK_LOCK_CONFLICT = """
     SELECT 1 FROM lock 
-    WHERE resource_id=? AND data_key=? AND state='held' 
-    AND NOT (mode='read' AND ?='read')
+    WHERE resource_id=?1 AND (data_key=?2 OR data_key='ALL' OR ?2='ALL') AND state='held'
+    AND NOT (mode='read' AND ?3='read')
 """
 
 INSERT_LOCK = """

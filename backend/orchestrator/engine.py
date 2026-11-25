@@ -9,13 +9,8 @@ from threading import Lock
 
 from backend.database.connection import OrchestratorDB
 
-CATALOG = {
-    "P1": ("Кредитный риск", [("deals", "R"), ("rates", "R"), ("credit", "W")]),
-    "P2": ("Рыночный риск", [("deals", "R"), ("rates", "R"), ("market", "W")]),
-    "Z1": ("Загрузка сделок", [("deals", "W"), ("rates", "R")]),
-    "Z2": ("Загрузка курсов", [("rates", "W"), ("deals", "R")]),
-    "FX": ("Обновление справочника", [("reference", "W")]),
-}
+from .catalog import CATALOG
+
 LABELS = dict(deals="Сделки", rates="Курсы", credit="Кредитный результат",
               market="Рыночный результат", reference="Справочник", work="Общая рабочая таблица")
 LEASE = 12
@@ -27,8 +22,9 @@ def now():
     return time.time()
 
 
-def event(s, job, message):
-    s["events"].append(dict(seq=len(s["events"]) + 1, at=now(), job=job, message=message))
+def event(s, job, message, event_type="status_changed", actor="system", **context):
+    s["events"].append(dict(seq=len(s["events"]) + 1, at=now(), job=job, message=message,
+                            type=event_type, actor=actor, **context))
 
 
 def resources(kind, day, shared=False):
@@ -80,10 +76,8 @@ class Engine:
         self.inbox_lock = Lock()
         self.inbox = []
         with closing(OrchestratorDB(self.db)) as store, store.state_transaction() as s:
-            if not s:
-                s.update(jobs=[], requests=[], results={}, heads={}, events=[], schedule=None)
-            s.setdefault("routes", {k: 1 for k in CATALOG})
-            s.setdefault("signals", {})
+            for kind in CATALOG:
+                s["routes"].setdefault(kind, 1)
 
     @contextmanager
     def tx(self):
@@ -132,7 +126,8 @@ class Engine:
                 created=now(), start=None, end=None, attempt=0, token=None, lease=0, inputs={},
                 result=None, reason="Ожидает проверки", rerun=bool(data.get("rerun"))))
         s["requests"].append(dict(key=key, signature=signature, job=jid, actor=actor, channel=channel))
-        event(s, jid, ("Присоединено обращение" if duplicate else "Принято обращение") + " · " + actor)
+        event(s, jid, ("Присоединено обращение" if duplicate else "Принято обращение") + " · " + actor,
+              "request_merged" if duplicate else "request_created", actor, request_key=key)
         return jid
 
     def submit(self, data):
@@ -196,7 +191,7 @@ class Engine:
             if decision == "approve" and actor == "Риск-менеджер":
                 v["approval"] = "reviewed"
                 j["reason"] = "Ожидает утверждения директора"
-                event(s, jid, actor + " · согласовано " + v["id"] + " · " + comment)
+                event(s, jid, actor + " · согласовано " + v["id"] + " · " + comment, "approval_granted", actor)
                 s["signals"][event_id] = [jid, decision, actor, None, comment, version]
                 return None
             if decision == "approve":
@@ -214,7 +209,8 @@ class Engine:
                         batch["requests"] += 1
                         break
             s["signals"][event_id]=[jid,decision,actor,successor,comment,version]
-            event(s,jid,actor + (" · согласовано " if decision=="approve" else " · отклонено ") + v["id"] + " · " + comment)
+            event(s,jid,actor + (" · согласовано " if decision=="approve" else " · отклонено ") + v["id"] + " · " + comment,
+                  "approval_granted" if decision=="approve" else "approval_rejected", actor)
             if successor:
                 event(s, jid, f"Создан перерасчёт RUN-{successor} для версии {v['id']}")
                 event(s, successor, f"Перерасчёт RUN-{jid} (версия {v['id']}) · {comment}")
@@ -258,7 +254,7 @@ class Engine:
 
     def claim(self):
         started = []
-        with self.tx() as s:
+        with closing(OrchestratorDB(self.db, initialize=False)) as store, store.state_transaction() as s:
             t = now()
             plan = s["schedule"]
             if plan and plan["due"] <= t:
@@ -268,6 +264,9 @@ class Engine:
                 if j["status"] == "running" and j["lease"] <= t:
                     self.fail(s, j, "Истёк срок владения")
             active = [j for j in s["jobs"] if j["status"] == "running"]
+            running_ids = {j["id"] for j in active}
+            owners = [owner for owner in store.held_resources()
+                      if owner["id"] is None or owner["id"] in running_ids]
             pending = [j for j in s["jobs"] if j["status"] == "queued"]
             pending.sort(key=lambda j: (0 if t-j["created"] >= PROTECT else 1,
                 0 if t-j["created"] >= PROTECT or j["channel"]=="schedule" else 1, j["id"]))
@@ -283,10 +282,11 @@ class Engine:
                     continue
                 reason = ""
                 blocker = None
-                for owner in active + protected:
+                for owner in owners + protected:
                     obj = collision(j["resources"], owner["resources"])
                     if obj:
-                        reason = f"{obj} · ожидает №{owner['id']}"
+                        reason = (f"{obj} · ожидает №{owner['id']}" if owner["id"] is not None
+                                  else f"{obj} · ресурс заблокирован")
                         blocker = owner["id"]
                         break
                 if reason or len(active) >= SLOTS:
@@ -305,6 +305,7 @@ class Engine:
                          inputs=inputs, attempt=j["attempt"]+1, reason="", wait_for=None)
                 event(s, j["id"], f"Допуск · попытка {j['attempt']} · получены все ресурсы")
                 active.append(j)
+                owners.append(j)
                 started.append(j.copy())
         return started
 

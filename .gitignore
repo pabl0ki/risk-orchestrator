@@ -45,6 +45,8 @@ node_modules/
 
 # Local database
 /data/*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 /stage4.sqlite3
 
 # Environment

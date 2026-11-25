@@ -1,12 +1,14 @@
 """Слой подключения к БД и бизнес-методы доступа к данным."""
 import sqlite3
 import json
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 from backend.database.utils import calculate_hash
-from backend.database import queries
+from backend.database import queries, workflow
+from backend.orchestrator.catalog import CATALOG
 
 
 class OrchestratorDB:
@@ -30,43 +32,38 @@ class OrchestratorDB:
         self.conn.execute("PRAGMA journal_mode=WAL;")
 
         schema_path = Path(__file__).parent / "schema.sql"
-        self.conn.executescript(schema_path.read_text(encoding="utf-8"))
-
-    def _read_state(self):
-        row = self.conn.execute("SELECT payload FROM ledger WHERE id=1").fetchone()
-        state = json.loads(row[0]) if row else {}
-        legacy_journal = "events" in state
-        if state and not legacy_journal:
-            events = self.conn.execute(
-                "SELECT payload FROM event WHERE event_type='orchestrator.operation' ORDER BY event_id"
-            )
-            state["events"] = [json.loads(item[0]) for item in events]
-        return state, row[0] if row else None, legacy_journal
+        with self.conn:
+            self.conn.executescript("BEGIN IMMEDIATE;\n" + schema_path.read_text(encoding="utf-8"))
+            self.conn.execute("DROP INDEX IF EXISTS bp_request_index_0")
+            self.conn.execute("DROP INDEX IF EXISTS stage_request_index_1")
+            legacy = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger'").fetchone()
+            if legacy:
+                row = self.conn.execute("SELECT payload FROM ledger WHERE id=1").fetchone()
+                if row:
+                    before = workflow.read_state(self.conn)
+                    state = json.loads(row[0])
+                    state.setdefault("events", before["events"])
+                    state.setdefault("routes", {code: 1 for code in CATALOG})
+                    state.setdefault("signals", {})
+                    workflow.save_changes(self.conn, before, state, CATALOG)
+                    if workflow.read_state(self.conn) != state:
+                        raise ValueError("Перенос ledger: данные после преобразования не совпадают.")
+                self.conn.execute("DROP TABLE ledger")
 
     def snapshot(self):
         self.conn.execute("BEGIN")
         with self.conn:
-            state, _, _ = self._read_state()
-            return state
+            return workflow.read_state(self.conn)
 
     @contextmanager
     def state_transaction(self):
         self.conn.execute("BEGIN IMMEDIATE")
         with self.conn:
-            state, original, legacy = self._read_state()
-            # Old ledger files keep their journal inside the state until the first commit.
-            existing = 0 if legacy else len(state.get("events", []))
+            state = workflow.read_state(self.conn)
+            original = deepcopy(state)
             yield state
-            events = state.get("events", [])
-            for entry in events[existing:]:
-                self.conn.execute(queries.INSERT_EVENT, (
-                    datetime.fromtimestamp(entry["at"]).isoformat(), "orchestrator.operation",
-                    "run", entry["job"], json.dumps(entry, ensure_ascii=False), "system",
-                ))
-            payload = json.dumps({k: v for k, v in state.items() if k != "events"},
-                                 ensure_ascii=False, separators=(",", ":"))
-            if payload != original:
-                self.conn.execute("INSERT OR REPLACE INTO ledger (id,payload) VALUES (1,?)", (payload,))
+            if state != original:
+                workflow.save_changes(self.conn, original, state, CATALOG)
 
     # --- Справочники ---
 
@@ -137,6 +134,12 @@ class OrchestratorDB:
                 queries.GET_BP_REQUEST_BY_HASH,
                 (bp_id, date, input_hash),
             ).fetchone()
+            if existing is None:
+                raise
+            self.conn.execute("""INSERT INTO bp_request(business_process_id,date,initiator_type,
+                initiator_id,input_payload,input_hash,submitted_at,status,merged_into_bp_request_id)
+                VALUES(?,?,?,?,?,?,?,'merged',?)""", (bp_id,date,initiator_type,initiator_id,
+                json.dumps(payload),input_hash,datetime.now().isoformat(),existing["bp_request_id"]))
             return {"status": "merged", "id": existing["bp_request_id"], "merged": True}
 
     # --- Заявки на этапы ---
@@ -387,6 +390,18 @@ class OrchestratorDB:
 
     def get_locks_snapshot(self) -> list[dict]:
         return self.conn.execute(queries.GET_LOCKS_SNAPSHOT).fetchall()
+
+    def held_resources(self):
+        """Group held database locks by execution for the scheduler's admission check."""
+        owners = {}
+        rows = self.conn.execute("""SELECT l.run_id,w.public_id,l.resource_id,l.data_key,l.mode
+            FROM lock l JOIN run r USING(run_id) JOIN stage_request sr USING(stage_request_id)
+            LEFT JOIN workflow w USING(bp_request_id) WHERE l.state='held' ORDER BY l.lock_id""")
+        for row in rows:
+            owner = owners.setdefault(row["run_id"], dict(id=row["public_id"], resources=[]))
+            owner["resources"].append([row["resource_id"], "*" if row["data_key"]=="ALL" else row["data_key"],
+                                       "R" if row["mode"]=="read" else "W"])
+        return list(owners.values())
 
     # --- Закрытие ---
 

@@ -360,4 +360,72 @@ def test_engine_migrates_legacy_events_once(tmp_path):
     assert [event["seq"] for event in events] == [1, 2]
     with closing(OrchestratorDB(path)) as db:
         assert [json.loads(row["payload"]) for row in reversed(db.get_recent_events())] == events
-        assert "events" not in json.loads(db.conn.execute("SELECT payload FROM ledger").fetchone()[0])
+        assert db.conn.execute("SELECT 1 FROM sqlite_master WHERE name='ledger'").fetchone() is None
+
+
+def test_engine_uses_relational_route(tmp_path):
+    from contextlib import closing
+    from backend.orchestrator.engine import Engine, calculate
+
+    path = tmp_path / "stages.sqlite"
+    engine = Engine(path)
+    params = dict(kind="P1", day="2026-11-22", approval=True)
+    jid = engine.submit(dict(params, actor="Анна", key="original"))
+    assert engine.submit(dict(params, actor="Регламент", key="duplicate", channel="schedule")) == jid
+    with closing(OrchestratorDB(path)) as db:
+        owner, duplicate = db.conn.execute("SELECT * FROM bp_request ORDER BY bp_request_id")
+        assert duplicate["status"] == "merged"
+        assert duplicate["merged_into_bp_request_id"] == owner["bp_request_id"]
+        assert db.get_stage_requests_by_bp_request(duplicate["bp_request_id"]) == []
+        job, = engine.claim()
+        assert len(db.get_locks_snapshot()) == len(job["resources"])
+        version = engine.publish(jid, job["token"], calculate(job))
+        assert not db.get_locks_snapshot()
+        engine = Engine(path)
+        engine.decide(jid, "approve", "Риск-менеджер", "review", version=version)
+        engine.decide(jid, "approve", "Директор", "publish", version=version)
+        rows = db.conn.execute("""SELECT s.stage_type,r.status,r.external_event FROM stage_request sr
+            JOIN stage s USING(stage_id) JOIN run r USING(stage_request_id)
+            WHERE sr.bp_request_id=? ORDER BY sr.stage_request_id""", (owner["bp_request_id"],)).fetchall()
+        assert [row[0] for row in rows] == ["calculation","approval","sign-off","publication"]
+        assert all(row[1] == "done" for row in rows)
+        assert [json.loads(row[2])["actor"] for row in rows[1:3]] == ["Риск-менеджер","Директор"]
+        assert db.conn.execute("SELECT version FROM published_result").fetchone()[0] == version
+        assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_unsupported_ledger_rolls_back(tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    path = tmp_path / "legacy.sqlite"
+    payload = json.dumps(dict(jobs=[], requests=[], results={}, heads={}, schedule=None, unknown=42))
+    with closing(sqlite3.connect(path)) as con, con:
+        con.execute("CREATE TABLE ledger(id INTEGER PRIMARY KEY,payload TEXT)")
+        con.execute("INSERT INTO ledger VALUES(1,?)",(payload,))
+    with pytest.raises(ValueError, match="ledger"):
+        OrchestratorDB(path)
+    with closing(sqlite3.connect(path)) as con:
+        assert con.execute("SELECT payload FROM ledger").fetchone()[0] == payload
+        assert con.execute("SELECT name FROM sqlite_master WHERE name='workflow'").fetchone() is None
+
+
+def test_admission_respects_table_lock_from_database(tmp_path):
+    from contextlib import closing
+    from backend.orchestrator.engine import Engine
+
+    path = tmp_path / "shared.sqlite"
+    engine = Engine(path)
+    day = "2026-11-22"
+    jid = engine.submit(dict(kind="P1", day=day, actor="Анна"))
+    with closing(OrchestratorDB(path)) as db:
+        pid = db.create_business_process("Импорт", "import", [])
+        sid = _make_stage(db, pid)
+        bid = _make_bp_request(db, pid, date=day)["id"]
+        rid = db.create_run(db.create_stage_request(bid, sid, day, 1, "import", []))
+        assert db.acquire_locks(rid, [dict(resource_id="deals", granularity="table",
+                                          data_key="ALL", mode="write")])
+        assert engine.claim() == []
+        assert db.release_locks(rid) == 1
+        job, = engine.claim()
+        assert job["id"] == jid

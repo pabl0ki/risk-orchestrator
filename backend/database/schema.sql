@@ -121,8 +121,8 @@ CREATE TABLE IF NOT EXISTS event (
   actor TEXT
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS bp_request_index_0 ON bp_request (business_process_id, date, input_hash);
-CREATE UNIQUE INDEX IF NOT EXISTS stage_request_index_1 ON stage_request (stage_id, date, input_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS pending_bp_hash ON bp_request (business_process_id, date, input_hash) WHERE status='pending';
+CREATE INDEX IF NOT EXISTS stage_hash ON stage_request (stage_id, date, input_hash);
 CREATE INDEX IF NOT EXISTS lock_index_2 ON lock (resource_id, granularity, data_key, state);
 CREATE UNIQUE INDEX IF NOT EXISTS lock_unique_idx ON lock (run_id, resource_id, granularity, data_key);
 CREATE INDEX IF NOT EXISTS event_index_3 ON event (entity_type, entity_id, timestamp);
@@ -132,11 +132,68 @@ CREATE INDEX IF NOT EXISTS event_index_4 ON event (event_type, timestamp);
 -- business_process: шаблон бизнес-процесса
 -- stage: этап бизнес-процесса
 -- bp_request: заявка на бизнес-процесс
--- stage_request: заявка на этап; уникальный индекс схлопывает дубликаты на уровне этапа, в том числе между разными бизнес-процессами
+-- Дубликат заявки процесса ссылается на оригинал и использует его этапы.
 -- run: запуск этапа; stage_request_id unique = один запуск на заявку
 -- lock: учётная таблица оркестратора (реестр намерений и фактов захвата), не механизм блокировок СУБД
 -- event: журнал событий
 -- input_hash в bp_request: ключ дубликатов SHA256(business_process_id + date + norm(input_payload))
 -- input_hash в stage_request: ключ дубликатов SHA256(stage_id + date + norm(input_payload))
 -- route и required_resources в stage: JSON для MVP, отдельные таблицы — задел на будущее
-CREATE TABLE IF NOT EXISTS ledger (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+-- Public RUN numbers remain stable across all stages of a business request.
+CREATE TABLE IF NOT EXISTS process_route (
+  code TEXT PRIMARY KEY, business_process_id INTEGER NOT NULL UNIQUE REFERENCES business_process,
+  revision INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workflow (
+  public_id INTEGER PRIMARY KEY, bp_request_id INTEGER NOT NULL UNIQUE REFERENCES bp_request,
+  attempt INTEGER NOT NULL, token TEXT, lease REAL NOT NULL, inputs TEXT NOT NULL,
+  result_version TEXT REFERENCES result_version(version) DEFERRABLE INITIALLY DEFERRED,
+  reason TEXT NOT NULL, start_at REAL, end_at REAL, calculated_at REAL,
+  wait_for INTEGER REFERENCES workflow, has_wait_for INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS request_receipt (
+  request_key TEXT PRIMARY KEY, bp_request_id INTEGER NOT NULL UNIQUE REFERENCES bp_request,
+  public_id INTEGER NOT NULL REFERENCES workflow
+);
+CREATE TABLE IF NOT EXISTS result_version (
+  version TEXT PRIMARY KEY, public_id INTEGER NOT NULL REFERENCES workflow,
+  resource TEXT NOT NULL, scope TEXT, previous TEXT REFERENCES result_version,
+  rows_json TEXT NOT NULL, inputs TEXT NOT NULL, algorithm TEXT NOT NULL, factor INTEGER NOT NULL,
+  token TEXT, approval TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS published_result (
+  resource_key TEXT PRIMARY KEY, version TEXT NOT NULL REFERENCES result_version
+);
+CREATE TABLE IF NOT EXISTS decision_receipt (
+  command_key TEXT PRIMARY KEY, public_id INTEGER NOT NULL REFERENCES workflow,
+  decision TEXT NOT NULL, actor TEXT NOT NULL, successor INTEGER REFERENCES workflow,
+  comment TEXT, version TEXT, signature_length INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS schedule (
+  id INTEGER PRIMARY KEY CHECK(id=1), process_code TEXT NOT NULL REFERENCES process_route,
+  business_date TEXT NOT NULL, period INTEGER NOT NULL, due REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS demo_batch (
+  batch_id INTEGER PRIMARY KEY, scenario TEXT NOT NULL, business_date TEXT NOT NULL, requests INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS demo_batch_job (
+  batch_id INTEGER NOT NULL REFERENCES demo_batch, public_id INTEGER NOT NULL REFERENCES workflow,
+  position INTEGER NOT NULL, PRIMARY KEY(batch_id, public_id)
+);
+CREATE TABLE IF NOT EXISTS workflow_event (
+  event_id INTEGER PRIMARY KEY REFERENCES event, seq INTEGER NOT NULL UNIQUE
+);
+
+CREATE TRIGGER IF NOT EXISTS log_lock_acquired AFTER INSERT ON lock WHEN NEW.state='held'
+BEGIN
+  INSERT INTO event(timestamp,event_type,entity_type,entity_id,payload,actor)
+  VALUES(NEW.acquired_at,'lock_acquired','lock',NEW.lock_id,
+         json_object('run_id',NEW.run_id,'resource',NEW.resource_id,'scope',NEW.data_key,'mode',NEW.mode),'system');
+END;
+CREATE TRIGGER IF NOT EXISTS log_lock_change AFTER UPDATE OF state ON lock WHEN OLD.state<>NEW.state
+BEGIN
+  INSERT INTO event(timestamp,event_type,entity_type,entity_id,payload,actor)
+  VALUES(CURRENT_TIMESTAMP,CASE NEW.state WHEN 'held' THEN 'lock_acquired'
+         WHEN 'expired' THEN 'lock_expired' ELSE 'lock_released' END,'lock',NEW.lock_id,
+         json_object('run_id',NEW.run_id,'resource',NEW.resource_id,'scope',NEW.data_key),'system');
+END;
