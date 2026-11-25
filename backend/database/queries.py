@@ -47,7 +47,7 @@ INSERT_BP_REQUEST = """
 
 GET_BP_REQUEST_BY_HASH = """
     SELECT bp_request_id, status FROM bp_request 
-    WHERE business_process_id=? AND date=? AND input_hash=?
+    WHERE business_process_id=? AND date=? AND input_hash=? AND status IN ('pending','expanded','running')
 """
 
 # --- Заявки на этапы ---
@@ -124,15 +124,14 @@ GET_RUNS_BY_STATUS = """
 UPDATE_RUN_HEARTBEAT = """
     UPDATE run 
     SET heartbeat_at = datetime('now'), 
-        lease_expires_at = datetime('now', '+60 seconds') 
-    WHERE run_id = ?
+        lease_expires_at = datetime('now', '+30 seconds')
+    WHERE run_id = ? AND status='running'
 """
 
 GET_STALE_RUNS = """
     SELECT * FROM run 
     WHERE status = 'running' 
-      AND lease_expires_at IS NOT NULL 
-      AND lease_expires_at < datetime('now', ?)
+      AND (lease_expires_at <= datetime('now') OR heartbeat_at <= datetime('now', ?))
 """
 
 # --- Внешние события ---
@@ -153,8 +152,8 @@ GET_RUNS_WAITING_EXTERNAL = """
 
 CHECK_LOCK_CONFLICT = """
     SELECT 1 FROM lock 
-    WHERE resource_id=? AND data_key=? AND state='held' 
-    AND NOT (mode='read' AND ?='read')
+    WHERE resource_id=?1 AND (data_key=?2 OR data_key='ALL' OR ?2='ALL') AND state='held'
+    AND NOT (mode='read' AND ?3='read')
 """
 
 INSERT_LOCK = """
@@ -175,7 +174,7 @@ GET_LOCKS_BY_RUN = """
 
 GET_ACTIVE_LOCKS = """
     SELECT * FROM lock
-    WHERE resource_id = ? AND data_key = ? AND state = 'held'
+    WHERE resource_id=?1 AND (data_key=?2 OR data_key='ALL' OR ?2='ALL') AND state='held'
 """
 
 GET_EXPIRED_LOCKS = """

@@ -64,6 +64,6 @@ def validate_dag(stages: list[dict]) -> tuple[bool, str | None]:
         if state[stage_id] == 0:
             cycle = dfs(stage_id, [])
             if cycle:
-                return False, f"Обнаружена циклическая зависимость: {cycle}"
+                return False, cycle if cycle.startswith("Зависимость") else f"Обнаружена циклическая зависимость: {cycle}"
     
     return True, None

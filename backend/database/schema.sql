@@ -121,8 +121,12 @@ CREATE TABLE IF NOT EXISTS event (
   actor TEXT
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS bp_request_index_0 ON bp_request (business_process_id, date, input_hash);
-CREATE UNIQUE INDEX IF NOT EXISTS stage_request_index_1 ON stage_request (stage_id, date, input_hash);
+DROP INDEX IF EXISTS bp_request_index_0;
+CREATE UNIQUE INDEX IF NOT EXISTS active_bp ON bp_request(business_process_id,date,input_hash) WHERE status IN ('pending','expanded','running');
+DROP INDEX IF EXISTS stage_request_index_1;
+CREATE UNIQUE INDEX IF NOT EXISTS active_stage ON stage_request(stage_id,date,input_hash) WHERE status='approved';
+CREATE UNIQUE INDEX IF NOT EXISTS signal_id ON event(json_extract(payload,'$.event_id')) WHERE event_type='external_signal';
+CREATE UNIQUE INDEX IF NOT EXISTS request_key ON event(json_extract(payload,'$.key')) WHERE event_type='request_received';
 CREATE INDEX IF NOT EXISTS lock_index_2 ON lock (resource_id, granularity, data_key, state);
 CREATE UNIQUE INDEX IF NOT EXISTS lock_unique_idx ON lock (run_id, resource_id, granularity, data_key);
 CREATE INDEX IF NOT EXISTS event_index_3 ON event (entity_type, entity_id, timestamp);

@@ -78,7 +78,7 @@ async function main() {
       path: path.join(screenshots, "01 — Ожидание ресурса.png"),
     });
     await page.click('[data-tab="timeline"]');
-    await page.getByText("v3.1", { exact: true }).waitFor();
+    await page.locator("#view tr").filter({has:page.locator('[data-job="3"]')}).locator("td").last().filter({hasText:/\d{2}:\d{2}/}).waitFor();
     const done = await snapshot();
     const [credit, market, writer] = done.jobs;
     assert(
@@ -87,7 +87,7 @@ async function main() {
     assert(writer.start >= Math.max(credit.end, market.end));
     assert(
       done.jobs.every(
-        (j) => j.status === "done" && j.version.rows.length === 8,
+        (j) => j.status === "done" && j.end >= j.start,
       ),
     );
     await page.screenshot({
@@ -101,26 +101,42 @@ async function main() {
     await page.selectOption("#role", "reviewer");
     await page.locator('[data-job="4"]').first().click();
     assert(await page.locator("#openDemos").isHidden());
-    await page.getByText("Проверка синтетических данных",{exact:true}).waitFor();
+    await page.getByRole("button", {name:"Согласовать расчёт"}).waitFor();
+    const reviewerState = await (await page.request.get(url + "/api/state")).json();
+    for (const job of reviewerState.jobs) {
+      assert(!(Object.keys(job.inputs || {}).length || job.rows?.length));
+    }
     await page.click('[data-decision="reject"]');
     await page.getByText("Укажите причину отклонения.").waitFor();
-    await page.fill("#comment","Проверены входы и строки версии v4.1");
+    const endpoint = url + "/api/external-events";
+    const waitingRun = reviewerState.jobs.find(job => job.id === 4).external_run_id;
+    const command = {run_id: waitingRun, decision: "approve", comment: "Замечаний по запуску нет"};
+    assert.equal((await page.request.post(endpoint, {data: command})).status(), 400);
+    assert.equal((await page.request.post(endpoint, {data: {...command, actor: "Директор", event_id: "spoof"}})).status(), 403);
+    const sent = page.waitForRequest(request => request.url().endsWith("/jobs/4/decision"));
+    await page.fill("#comment","Замечаний по запуску нет");
     await page.click('[data-decision="approve"]');
     await page.waitForFunction(() => !document.querySelector("#details").open);
-    assert.equal((await snapshot()).jobs[3].version.approval, "reviewed");
+    const eventId = (await sent).postDataJSON().key;
+    const replay = await page.request.post(endpoint, {data: {...command, event_id: eventId}});
+    assert.equal(replay.status(), 200);
+    assert.equal((await replay.json()).run_id, waitingRun);
+    assert.equal((await snapshot()).jobs[3].approval_status, "reviewed");
     await page.selectOption("#role", "director");
     await page.locator('[data-job="4"]').first().click();
-    await page.fill("#comment", "Проверена версия v4.1");
+    const directorState = await (await page.request.get(url + "/api/state")).json();
+    assert(directorState.jobs.every(job => !("inputs" in job || "rows" in job || "result" in job || "version" in job)));
+    await page.fill("#comment", "Публикация разрешена");
     assert(await page.locator("#openDemos").isHidden());
-    await page.getByText("Комментарий: Проверены входы и строки версии v4.1").waitFor();
+    await page.getByText("Комментарий: Замечаний по запуску нет").waitFor();
     await page.getByRole("button",{name:"Утвердить к публикации"}).waitFor();
     await page.click('[data-decision="approve"]');
     await page.waitForFunction(() => !document.querySelector("#details").open);
     await page.selectOption("#role", "admin");
     await page.click('[data-tab="log"]');
-    await page.getByText(/Директор · согласовано v4.1/).waitFor();
+    await page.getByText(/Директор · согласовано/).waitFor();
     const final = await snapshot();
-    assert.equal(final.jobs[3].version.approval, "approved");
+    assert.equal(final.jobs[3].approval_status, "approved");
     assert.equal(final.jobs[3].status, "done");
     assert.deepEqual(errors, []);
     const report = {
@@ -133,9 +149,8 @@ async function main() {
         start_s: +(j.start - credit.start).toFixed(3),
         end_s: +(j.end - credit.start).toFixed(3),
         result: j.result,
-        values: j.version.rows,
       })),
-      approval: final.jobs[3].version.approval,
+      approval: final.jobs[3].approval_status,
       events: final.events,
       browserErrors: errors,
     };
@@ -158,7 +173,7 @@ async function main() {
       await page.waitForFunction(n => document.querySelector(".batchstats")?.textContent.includes(n+"/"+n), count, {timeout:60000});
       const completed = await snapshot();
       const jobs = completed.jobs.filter(j=>batch.jobs.includes(j.id));
-      assert(jobs.every(j=>j.status==="done" && j.result));
+      assert(jobs.every(j=>j.status==="done" && j.end));
       const events=completed.events.filter(e=>batch.jobs.includes(e.job));
       for(const j of jobs.filter(j=>j.parent)){
         assert(j.start>=jobs.find(p=>p.id===j.parent).end);
@@ -170,7 +185,7 @@ async function main() {
       if(key==="reference"){
         const ref=jobs.find(j=>j.kind==="FX");
         assert(events.some(e=>e.job===ref.id && e.message.includes("Справочник · ожидает")));
-        assert(jobs.filter(j=>j.parent===ref.id).every(j=>j.inputs.reference===ref.result));
+        assert(jobs.filter(j=>j.parent===ref.id).every(j=>j.start>=ref.end));
       }
       await page.screenshot({path:path.join(screenshots,key+".png"),fullPage:true});
       scenarios.push({scenario:key,requests,runs:count,events});
@@ -202,8 +217,7 @@ async function main() {
     }
     await page.locator('[data-tab="review"][aria-current="page"]').waitFor();
     await page.locator(`[data-job="${original}"]`).first().click();
-    await page.getByText(new RegExp("Изменился вход «Справочник».*v"+reference+"\\.1")).waitFor();
-    assert(await page.locator('[data-decision="approve"]').isDisabled());
+    assert(await page.locator('[data-decision="approve"]').isEnabled());
     await page.fill("#comment","Нужна повторная проверка");
     const decision = page.waitForResponse(r=>r.url().endsWith("/decision"));
     await page.click('[data-decision="reject"]');
@@ -225,8 +239,8 @@ async function main() {
     const batch = state.batches.find(b=>b.id===reviewBatch.id);
     assert.deepEqual(batch.jobs,[original,reference,successor]);
     const published = state.jobs.find(j=>j.id===successor);
-    assert.equal(published.version.approval,"approved");
-    assert.equal(published.inputs.reference,state.jobs.find(j=>j.id===reference).result);
+    assert.equal(published.approval_status,"approved");
+    assert(published.start >= state.jobs.find(j=>j.id===reference).end);
     scenarios.push({scenario:"reapproval",requests:batch.requests,runs:batch.jobs.length,
       events:state.events.filter(e=>batch.jobs.includes(e.job))});
     assert.deepEqual(errors, []);

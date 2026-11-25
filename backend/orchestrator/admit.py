@@ -1,118 +1,84 @@
-"""Модуль допуска заявок на этапы."""
-from backend.database.connection import OrchestratorDB
+"""Deduplication, dependencies, compatibility and atomic admission."""
+import json
+import time
+
+SLOTS = 4
+LABELS = dict(deals="Сделки", rates="Курсы", credit="Кредитный результат",
+              market="Рыночный результат", reference="Справочник", work="Общая рабочая таблица")
+
+
+def required_locks(stage, day, params):
+    locks = []
+    for spec in json.loads(stage["required_resources"] or "[]"):
+        mode = {"R":"read","W":"write"}.get(spec["mode"],spec["mode"])
+        if mode not in ("read","write","exclusive"):
+            raise ValueError("Некорректный режим доступа.")
+        table = spec.get("granularity") == "table"
+        locks.append(dict(resource_id=spec["resource_id"], granularity="table" if table else "partition",
+                          data_key="ALL" if table else spec.get("data_key") or day, mode=mode))
+    if params.get("shared") and stage["stage_type"] == "calculation":
+        locks.append(dict(resource_id="work",granularity="table",data_key="ALL",mode="write"))
+    return locks
 
 
 class Admit:
-    """Принимает решение по заявке на этап: запустить / в очередь / отклонить."""
-
-    def __init__(self, db: OrchestratorDB):
+    def __init__(self, db):
         self.db = db
 
-    def admit_pending(self, limit: int = 100) -> list[dict]:
-        """
-        Обрабатывает заявки в статусах created/queued.
-        
-        Возвращает список принятых решений.
-        """
-        decisions = []
-        pending = self.db.get_pending_stage_requests(limit)
-        
-        for sr in pending:
-            decision = self._admit_one(sr)
-            decisions.append(decision)
-        
-        return decisions
+    def wait(self, sr, status, message, blocker=None):
+        info = dict(message=message,wait_for=blocker)
+        if json.loads(sr["waiting_for"] or "null") != info:
+            self.db.update_stage_request_status(sr["stage_request_id"],status,info)
+            self.db.log_event(status,"bp_request",sr["bp_request_id"],info)
+        return {"decision":status}
 
-    def _admit_one(self, stage_request: dict) -> dict:
-        """
-        Проверяет одну заявку по четырём правилам.
-        """
-        sr_id = stage_request["stage_request_id"]
-        stage_id = stage_request["stage_id"]
-        date = stage_request["date"]
-        
-        # Правило 1: Дубликат (проверяется при создании, но на всякий случай)
-        # Если stage_request уже существует, значит дубликата нет
-        
-        # Правило 2: Зависимости
-        all_done, unfinished = self.db.check_dependencies(sr_id)
-        if not all_done:
-            self.db.update_stage_request_status(
-                sr_id, "waiting_dependency", 
-                {"type": "dependency", "ids": unfinished}
-            )
-            return {"stage_request_id": sr_id, "decision": "waiting_dependency", "reason": f"Ждёт родителей: {unfinished}"}
-        
-        # Правило 3: Ресурсы
-        stage = self.db.get_stage(stage_id)
-        if not stage:
-            self.db.update_stage_request_status(sr_id, "rejected", {"type": "config", "reason": "Этап не найден"})
-            return {"stage_request_id": sr_id, "decision": "rejected", "reason": "Этап не найден"}
-        
-        # Парсим required_resources
-        import json
-        required_resources = json.loads(stage.get("required_resources") or "[]")
-        
-        if not required_resources:
-            # Нет ресурсов — сразу создаём run
-            return self._approve_and_create_run(sr_id, stage_id, date, [])
-        
-        # Проверяем конфликты
-        conflicts = []
-        for resource in required_resources:
-            resource_id = resource["resource_id"]
-            data_key = resource.get("data_key") or date
-            mode = resource["mode"]
-            
-            active_locks = self.db.get_active_locks(resource_id, data_key)
-            for lock in active_locks:
-                if not (lock["mode"] == "read" and mode == "read"):
-                    conflicts.append({
-                        "resource_id": resource_id,
-                        "data_key": data_key,
-                        "held_by": lock["run_id"],
-                        "mode": lock["mode"]
-                    })
-        
-        if conflicts:
-            self.db.update_stage_request_status(
-                sr_id, "waiting_resource",
-                {"type": "resource", "conflicts": conflicts}
-            )
-            return {"stage_request_id": sr_id, "decision": "waiting_resource", "reason": f"Ресурсы заняты: {conflicts}"}
-        
-        # Правило 4: Атомарный захват
-        locks = [
-            {
-                "resource_id": r["resource_id"],
-                "granularity": r.get("granularity") or "partition",
-                "data_key": r.get("data_key") or date,
-                "mode": r["mode"]
-            }
-            for r in required_resources
-        ]
-        
-        success = self.db.acquire_locks(sr_id, locks)  # Временно используем sr_id как run_id
-        if not success:
-            # Гонка — кто-то захватил ресурсы между проверкой и захватом
-            self.db.update_stage_request_status(sr_id, "queued")
-            return {"stage_request_id": sr_id, "decision": "queued", "reason": "Гонка при захвате"}
-        
-        return self._approve_and_create_run(sr_id, stage_id, date, locks)
-
-    def _approve_and_create_run(self, sr_id: int, stage_id: int, date: str, locks: list[dict]) -> dict:
-        """Одобряет заявку и создаёт запуск."""
-        # Обновляем статус stage_request
-        self.db.update_stage_request_status(sr_id, "approved")
-        
-        # Создаём run
-        run_id = self.db.create_run(sr_id)
-        
-        # Логируем
-        self.db.log_event(
-            "run_created", "run", run_id,
-            {"stage_request_id": sr_id, "stage_id": stage_id, "date": date, "locks": len(locks)},
-            "system"
-        )
-        
-        return {"stage_request_id": sr_id, "decision": "approved", "run_id": run_id}
+    def one(self, sr_id):
+        db = self.db
+        with db.transaction():
+            sr = db.conn.execute("SELECT * FROM stage_request WHERE stage_request_id=?", (sr_id,)).fetchone()
+            if not sr or sr["status"] not in ("created","queued","waiting_dependency","waiting_resource"):
+                return {"decision":"skip"}
+            duplicate = db.conn.execute("""SELECT stage_request_id FROM stage_request WHERE stage_id=? AND date=?
+                AND input_hash=? AND status='approved' AND stage_request_id<>?""",
+                (sr["stage_id"],sr["date"],sr["input_hash"],sr_id)).fetchone()
+            if duplicate:
+                db.conn.execute("UPDATE stage_request SET status='merged',merged_into_stage_request_id=? WHERE stage_request_id=?",
+                                (duplicate[0],sr_id))
+                return {"decision":"merged"}
+            ready, unfinished = db.check_dependencies(sr_id)
+            if not ready:
+                parent = db.conn.execute("SELECT bp_request_id,status FROM stage_request WHERE stage_request_id=?", (unfinished[0],)).fetchone()
+                if not parent or parent["status"] in ("failed","cancelled","rejected"):
+                    db.conn.execute("UPDATE stage_request SET status='rejected',rejection_reason='parent_failed' WHERE stage_request_id=?", (sr_id,))
+                    db.conn.execute("UPDATE bp_request SET status='rejected' WHERE bp_request_id=?", (sr["bp_request_id"],))
+                    return {"decision":"rejected"}
+                return self.wait(sr,"waiting_dependency",f"Ожидание предшественника №{parent[0]}",parent[0])
+            stage = db.get_stage(sr["stage_id"])
+            params = json.loads(db.conn.execute("SELECT input_payload FROM bp_request WHERE bp_request_id=?", (sr["bp_request_id"],)).fetchone()[0])
+            try:
+                locks = required_locks(stage,sr["date"],params)
+            except (ValueError,KeyError) as exc:
+                db.conn.execute("UPDATE stage_request SET status='rejected',rejection_reason=? WHERE stage_request_id=?", (str(exc),sr_id))
+                db.conn.execute("UPDATE bp_request SET status='rejected' WHERE bp_request_id=?", (sr["bp_request_id"],))
+                return {"decision":"rejected"}
+            for lock in locks:
+                for held in db.get_active_locks(lock["resource_id"],lock["data_key"]):
+                    if held["mode"] == lock["mode"] == "read":
+                        continue
+                    owner = db.conn.execute("SELECT bp_request_id FROM run JOIN stage_request USING(stage_request_id) WHERE run_id=?", (held["run_id"],)).fetchone()[0]
+                    name = LABELS.get(lock["resource_id"],lock["resource_id"])
+                    return self.wait(sr,"waiting_resource",f"{name} · ожидает №{owner}",owner)
+            external = stage["stage_type"] in ("approval","sign-off")
+            if not external and len(db.get_runs_by_status("running")) >= SLOTS:
+                return self.wait(sr,"queued","Все исполнители заняты")
+            rid = db.create_run(sr_id)
+            if not db.acquire_locks(rid,locks):
+                raise RuntimeError("Конфликт блокировок внутри транзакции допуска.")
+            db.update_stage_request_status(sr_id,"approved")
+            status = "waiting_external" if external else "running"
+            db.update_run_status(rid,status,started_at=time.time())
+            db.conn.execute("UPDATE bp_request SET status=? WHERE bp_request_id=?", ("review" if external else "running",sr["bp_request_id"]))
+            if not external:
+                db.update_heartbeat(rid)
+            db.log_event("run_created","run",rid,dict(job=sr["bp_request_id"],message="Ожидает решения" if external else "Допуск · получены все ресурсы"))
+            return {"decision":status,"id":sr["bp_request_id"],"run_id":rid,"token":str(rid)}

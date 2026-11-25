@@ -1,60 +1,44 @@
-"""Модуль приёма внешних событий (согласование, утверждение)."""
-from backend.database.connection import OrchestratorDB
-from backend.orchestrator.release import Release
+"""Role-bound, idempotent approval commands."""
+import json
+from .release import Release
+from .admit import Admit
+
+ROLES = {"approval":"Риск-менеджер","sign-off":"Директор"}
 
 
-class ExternalEvents:
-    """Принимает внешние сигналы и обновляет запуски."""
+def previous_signal(db, event_id):
+    row = db.conn.execute("SELECT payload FROM event WHERE event_type='external_signal' AND json_extract(payload,'$.event_id')=?", (event_id,)).fetchone()
+    return json.loads(row[0]) if row else None
 
-    def __init__(self, db: OrchestratorDB):
-        self.db = db
-        self.release = Release(db)
 
-    def receive_signal(self, run_id: int, actor: str, decision: str, comment: str = "") -> dict:
-        """
-        Принимает сигнал согласования/утверждения.
-        
-        decision: 'approve' или 'reject'
-        """
-        if decision not in ("approve", "reject"):
-            return {"error": "Некорректное решение"}
-        
-        # 1. Проверяем запуск
-        run = self.db.conn.execute(
-            "SELECT * FROM run WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        
-        if not run:
-            return {"error": "Запуск не найден"}
-        
-        if run["status"] != "waiting_external":
-            return {"error": f"Запуск не в статусе waiting_external (текущий: {run['status']})"}
-        
-        # 2. Обновляем external_event
-        external_event = {
-            "actor": actor,
-            "decision": decision,
-            "comment": comment,
-            "received_at": "now"
-        }
-        self.db.update_run_external_event(run_id, external_event)
-        
-        # 3. Логируем событие
-        self.db.log_event(
-            "external_signal", "run", run_id,
-            external_event, actor
-        )
-        
-        # 4. Обрабатываем решение
+def receive_signal(db, run_id, actor, decision, event_id, comment, rerun):
+    with db.transaction():
+        if not isinstance(event_id,str) or not event_id.strip() or decision not in ("approve","reject") or not isinstance(comment,str):
+            raise ValueError("Нужны ID события и корректное решение.")
+        if decision=="reject" and not comment.strip():
+            raise ValueError("Укажите причину отклонения.")
+        command = dict(event_id=event_id,run_id=run_id,actor=actor,decision=decision,comment=comment)
+        old = previous_signal(db,event_id)
+        if old:
+            if any(old.get(k)!=v for k,v in command.items()):
+                raise ValueError("ID события уже использован.")
+            return old
+        row = db.conn.execute("""SELECT r.status,s.stage_type,sr.bp_request_id,b.initiator_id
+            FROM run r JOIN stage_request sr USING(stage_request_id) JOIN stage s USING(stage_id)
+            JOIN bp_request b USING(bp_request_id) WHERE run_id=?""",(run_id,)).fetchone()
+        if not row or row["status"]!="waiting_external" or ROLES.get(row["stage_type"])!=actor:
+            raise ValueError("Решение недоступно для текущего этапа.")
+        if row["initiator_id"]==actor:
+            raise ValueError("Инициатор не может согласовать собственную заявку.")
+        jid = row["bp_request_id"]
+        db.update_run_external_event(run_id,command)
+        Release(db).release_run(run_id,"done" if decision=="approve" else "rejected")
         if decision == "approve":
-            # Возвращаем в running для финального коммита
-            self.db.update_run_status(run_id, "running")
-            self.db.log_event(
-                "run_resumed", "run", run_id,
-                {"reason": "Согласование получено"}, actor
-            )
-            return {"run_id": run_id, "status": "running", "action": "resume"}
-        else:  # reject
-            # Завершаем запуск
-            result = self.release.release_run(run_id, "failed")
-            return {"run_id": run_id, "status": "failed", "action": "reject", **result}
+            for sr in db.get_stage_requests_by_bp_request(jid):
+                stage = db.get_stage(sr["stage_id"])
+                if stage["stage_type"] in ROLES and sr["status"] == "queued":
+                    Admit(db).one(sr["stage_request_id"])
+        command.update(job=jid, successor=rerun(jid) if decision=="reject" else None,
+                       message=actor+(" · согласовано" if decision=="approve" else " · отклонено"))
+        db.log_event("external_signal","run",run_id,command,actor)
+        return command

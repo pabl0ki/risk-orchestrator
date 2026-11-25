@@ -1,40 +1,40 @@
-"""Фоновый исполнитель."""
+"""Simulate an opaque executor; only execution status crosses the boundary."""
 import time
-import threading
 from multiprocessing import parent_process
 from concurrent.futures import ThreadPoolExecutor
-
-from backend.orchestrator.engine import Engine, SLOTS, HEARTBEAT_INTERVAL
-from backend.orchestrator.calculations import calculate
+from .engine import Engine, SLOTS
+from .sweep_queue import SWEEP_INTERVAL
 
 
 def execute(engine, job, duration):
-    deadline = time.monotonic() + duration
-    stop_heartbeat = threading.Event()
-    
-    def heartbeat_loop():
-        while not stop_heartbeat.is_set():
-            if not engine.heartbeat(job["id"], job["token"]):
-                break
-            stop_heartbeat.wait(HEARTBEAT_INTERVAL)
-    
-    hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-    hb_thread.start()
-    
+    deadline = time.monotonic()+duration
     try:
-        time.sleep(duration)  # имитация работы расчётного ядра
-        engine.publish(job["id"], job["token"])  # без rows
-    except Exception as error:
-        engine.execution_error(job["id"], job["token"], error)
-    finally:
-        stop_heartbeat.set()
-        hb_thread.join()
+        while True:
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(10,remaining))
+            if not engine.heartbeat(job["id"],job["token"]):
+                return
+        engine.publish(job["id"],job["token"])
+    except Exception as exc:
+        engine.execution_error(job["id"],job["token"],exc)
 
 
 def run_worker(database, duration, stop):
     engine = Engine(database)
+    next_sweep = next_watchdog = 0
+    last_revision = None
     with ThreadPoolExecutor(max_workers=SLOTS) as pool:
         while not stop.is_set() and parent_process().is_alive():
-            for job in engine.claim():
-                pool.submit(execute, engine, job, duration)
-            stop.wait(0.2)
+            now = time.monotonic()
+            revision = engine.queue_revision()
+            maintenance = now >= next_sweep
+            if maintenance or revision != last_revision or now >= next_watchdog:
+                for job in engine.claim(maintenance):
+                    pool.submit(execute,engine,job,duration)
+                last_revision = revision
+                next_watchdog = now + 10
+            if maintenance:
+                next_sweep = now + SWEEP_INTERVAL
+            stop.wait(.2)

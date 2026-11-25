@@ -94,32 +94,15 @@ def create_app(database, duration):
             jobs = [j for j in jobs if j["id"] in owned]
         if role(request) in ("reviewer", "director"):
             stage = "pending" if role(request) == "reviewer" else "reviewed"
-            jobs = [j for j in jobs if j["status"] == "review" and snapshot["results"][j["result"]]["approval"] == stage]
+            jobs = [j for j in jobs if j["status"] == "review" and j["approval_status"] == stage]
         ids = {j["id"] for j in jobs}
-        # Decision receipts also preserve links for reruns created by older versions.
-        for original, decision, _, successor, *_ in snapshot["signals"].values():
-            if decision == "reject" and successor:
-                snapshot["jobs"][original-1]["rerun_to"] = successor
-                snapshot["jobs"][successor-1]["rerun_from"] = original
         for j in jobs:
-            if role(request) in ("reviewer", "director"):
-                version = snapshot["results"][j["result"]]
-                rows = version["rows"]
-                previous = snapshot["results"].get(version.get("previous"))
-                review = next((sig for sig in snapshot["signals"].values()
-                               if sig[:3] == [j["id"], "approve", "Риск-менеджер"]), None)
-                j["assessment"] = dict(total=sum(rows), count=len(rows),
-                    previous_id=previous["id"] if previous else None,
-                    previous_total=sum(previous["rows"]) if previous else None,
-                    **engine.approval_checks(snapshot,j,version),
-                    reviewed_by=review[2] if review else None,
-                    comment=review[4] if review and len(review)>4 else "")
-                if role(request) == "reviewer":
-                    j["assessment"]["source_rows"] = {k:v["rows"] for k,v in j["inputs"].items()}
-            j.pop("token")
-            j["inputs"] = {k:v["id"] for k,v in j["inputs"].items()}
-            j["version"] = snapshot["results"].get(j["result"], {}).copy()
-            j["version"].pop("token", None)
+            j.pop("token", None)
+            if role(request) in ("reviewer","director"):
+                for field in ("inputs","factor","resources","result"):
+                    j.pop(field,None)
+            else:
+                j["version"] = {"approval":j["approval_status"]}
             actors = [r["actor"] for r in snapshot["requests"] if r["job"] == j["id"]]
             j["initiators"] = [j["actor"]]
             j["subscribers"] = list(dict.fromkeys(actor for actor in actors if actor != j["actor"]))
@@ -153,9 +136,9 @@ def create_app(database, duration):
     @api.post("/api/jobs/{jid}/decision")
     def decide(jid: int, request: Request, data: dict):
         actor = require(request,"reviewer","director")
-        if not all(isinstance(data.get(k), str) and data[k] for k in ("version","decision","key")):
-            raise ValueError("Нужны решение, версия и ID команды.")
-        return {"successor":engine.decide(jid,data["decision"],actor,data["key"],data.get("comment",""),data["version"])}
+        if not all(isinstance(data.get(k), str) and data[k] for k in ("decision","key")):
+            raise ValueError("Нужны решение и ID команды.")
+        return {"successor":engine.decide(jid,data["decision"],actor,data["key"],data.get("comment",""),data.get("version"))}
 
     @api.get("/")
     def index():
@@ -171,13 +154,11 @@ def create_app(database, duration):
     def external_event(request: Request, data: dict):
         """Принимает внешнее событие (согласование/утверждение)."""
         actor = require(request, "reviewer", "director")
-        if not all(k in data for k in ("run_id", "decision")):
-            raise ValueError("Нужны run_id и decision.")
-        return engine.decide(
-            data["run_id"], data["decision"], actor,
-            data.get("event_id", uuid.uuid4().hex),
-            data.get("comment", ""), data.get("version")
-        )
+        if not isinstance(data.get("run_id"),int) or not isinstance(data.get("event_id"),str):
+            raise ValueError("Нужны run_id и event_id.")
+        if data.get("actor",actor) != actor:
+            raise HTTPException(403,"Роль не соответствует автору решения.")
+        return engine.external(data["run_id"],actor,data.get("decision"),data["event_id"],data.get("comment",""))
 
     return api
 

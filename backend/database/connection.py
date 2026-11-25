@@ -32,16 +32,26 @@ class OrchestratorDB:
         schema_path = Path(__file__).parent / "schema.sql"
         self.conn.executescript(schema_path.read_text(encoding="utf-8"))
 
-    def _read_state(self):
-        row = self.conn.execute("SELECT payload FROM ledger WHERE id=1").fetchone()
-        state = json.loads(row[0]) if row else {}
-        legacy_journal = "events" in state
-        if state and not legacy_journal:
-            events = self.conn.execute(
-                "SELECT payload FROM event WHERE event_type='orchestrator.operation' ORDER BY event_id"
-            )
-            state["events"] = [json.loads(item[0]) for item in events]
-        return state, row[0] if row else None, legacy_journal
+    @contextmanager
+    def transaction(self):
+        if self.conn.in_transaction:
+            with self.savepoint():
+                yield self
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        with self.conn:
+            yield self
+
+    @contextmanager
+    def savepoint(self):
+        self.conn.execute("SAVEPOINT operation")
+        try:
+            yield
+        except BaseException:
+            self.conn.execute("ROLLBACK TO operation")
+            raise
+        finally:
+            self.conn.execute("RELEASE operation")
 
     # --- Справочники ---
 
@@ -130,6 +140,8 @@ class OrchestratorDB:
                 queries.GET_BP_REQUEST_BY_HASH,
                 (bp_id, date, input_hash),
             ).fetchone()
+            if existing is None:
+                raise
             return {"status": "merged", "id": existing["bp_request_id"], "merged": True}
 
     def get_all_bp_requests(self) -> list[dict]:
@@ -212,8 +224,11 @@ class OrchestratorDB:
         ).fetchall()
 
     def update_heartbeat(self, run_id: int) -> bool:
-        cursor = self.conn.execute(queries.UPDATE_RUN_HEARTBEAT, (run_id,))
-        return cursor.rowcount > 0
+        with self.transaction():
+            cursor = self.conn.execute(queries.UPDATE_RUN_HEARTBEAT, (run_id,))
+            if cursor.rowcount:
+                self.conn.execute("UPDATE lock SET expires_at=datetime('now','+30 seconds') WHERE run_id=? AND state='held'",(run_id,))
+            return cursor.rowcount > 0
 
     def get_stale_runs(self, threshold_seconds: int) -> list[dict]:
         return self.conn.execute(
@@ -224,7 +239,7 @@ class OrchestratorDB:
         """Возвращает все запуски с контекстом (bp_name, date, required_resources и т.д.)."""
         return self.conn.execute("""
             SELECT r.run_id, r.status AS run_status, r.created_at, r.started_at, r.finished_at,
-                r.heartbeat_at, r.lease_expires_at, r.parent_run_id, r.result_payload,
+                r.heartbeat_at, r.lease_expires_at, r.parent_run_id,
                 sr.date, sr.stage_id, sr.waiting_for,
                 s.stage_type, s.required_resources, s.business_process_id,
                 bp.name AS bp_name, bp.risk_type,
@@ -240,31 +255,18 @@ class OrchestratorDB:
     # --- Блокировки ---
 
     def acquire_locks(self, run_id: int, locks: list[dict]) -> bool:
+        class Conflict(Exception):
+            pass
         try:
-            self.conn.execute("BEGIN IMMEDIATE;")
-            for lock in locks:
-                conflict = self.conn.execute(
-                    queries.CHECK_LOCK_CONFLICT,
-                    (lock["resource_id"], lock["data_key"], lock["mode"]),
-                ).fetchone()
-                if conflict:
-                    self.conn.execute("ROLLBACK;")
-                    return False
-                self.conn.execute(
-                    queries.INSERT_LOCK,
-                    (
-                        lock["resource_id"],
-                        lock["granularity"],
-                        lock["data_key"],
-                        run_id,
-                        lock["mode"],
-                        datetime.now().isoformat(),
-                    ),
-                )
-            self.conn.execute("COMMIT;")
+            with self.transaction():
+                for lock in locks:
+                    args = (lock["resource_id"], lock["data_key"], lock["mode"])
+                    if self.conn.execute(queries.CHECK_LOCK_CONFLICT, args).fetchone():
+                        raise Conflict
+                    self.conn.execute(queries.INSERT_LOCK, (lock["resource_id"], lock["granularity"],
+                        lock["data_key"], run_id, lock["mode"], datetime.now().isoformat()))
             return True
-        except Exception:
-            self.conn.execute("ROLLBACK;")
+        except Conflict:
             return False
 
     def release_locks(self, run_id: int) -> int:
@@ -333,15 +335,12 @@ class OrchestratorDB:
         query = f"""
             SELECT sr.stage_request_id, sr.status, r.status AS run_status
             FROM stage_request sr
-            LEFT JOIN run r ON r.stage_request_id = sr.stage_request_id
+            LEFT JOIN run r ON r.stage_request_id = COALESCE(sr.merged_into_stage_request_id,sr.stage_request_id)
             WHERE sr.stage_request_id IN ({placeholders})
         """
         parents = self.conn.execute(query, parent_ids).fetchall()
-        unfinished = [
-            p["stage_request_id"]
-            for p in parents
-            if p["run_status"] != "done"
-        ]
+        done = {p["stage_request_id"] for p in parents if p["run_status"] == "done"}
+        unfinished = [sid for sid in parent_ids if sid not in done]
         return len(unfinished) == 0, unfinished
 
     # --- Завершение и пробуждение (для release) ---
@@ -383,7 +382,10 @@ class OrchestratorDB:
             queries.UPDATE_RUN_EXTERNAL_EVENT, (json.dumps(external_event), run_id),
         )
 
-    def get_runs_waiting_external(self) -> list[dict]:
+    def get_runs_waiting_external(self, bp_request_id=None) -> list[dict]:
+        if bp_request_id is not None:
+            return self.conn.execute("""SELECT r.* FROM run r JOIN stage_request sr USING(stage_request_id)
+                WHERE sr.bp_request_id=? AND r.status='waiting_external' ORDER BY r.run_id""", (bp_request_id,)).fetchall()
         return self.conn.execute(queries.GET_RUNS_WAITING_EXTERNAL).fetchall()
 
     # --- DAG-валидация ---
@@ -401,6 +403,12 @@ class OrchestratorDB:
         return self.conn.execute(queries.GET_BP_REQUEST_FULL, (bp_request_id,)).fetchall()
 
     # --- Закрытие ---
+
+    def get_queue_snapshot(self):
+        return self.conn.execute(queries.GET_QUEUE_SNAPSHOT).fetchall()
+
+    def get_locks_snapshot(self):
+        return self.conn.execute(queries.GET_LOCKS_SNAPSHOT).fetchall()
 
     def close(self):
         self.conn.close()

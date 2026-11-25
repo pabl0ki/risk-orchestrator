@@ -1,16 +1,18 @@
-"""Оркестратор на реляционной схеме. API для фронта сохранён."""
-import hashlib
+"""Relational process orchestrator. Public job IDs identify process requests."""
 import json
 import time
 import uuid
-from concurrent.futures import Future
 from contextlib import closing, contextmanager
 from datetime import date
-from threading import Lock
 
 from backend.database.connection import OrchestratorDB
+from .expand import Expand
+from .admit import Admit
+from .release import Release
+from .sweep_queue import sweep_queue
+from .external_events import receive_signal, previous_signal
+from .view import snapshot
 
-# --- Каталог процессов (маппинг на бизнес-процессы) ---
 CATALOG = {
     "P1": ("Кредитный риск", [("deals", "R"), ("rates", "R"), ("credit", "W")]),
     "P2": ("Рыночный риск", [("deals", "R"), ("rates", "R"), ("market", "W")]),
@@ -33,348 +35,164 @@ SLOTS = 4
 def now():
     return time.time()
 
-class Engine:
-    """Оркестратор на реляционной схеме."""
 
+class Engine:
     def __init__(self, db_path):
         self.db_path = str(db_path)
-        self.inbox_lock = Lock()
-        self.inbox = []
-        self._init_catalog()
-
-    def _init_catalog(self):
-        """Инициализирует справочные данные (business_process, stage) из CATALOG."""
-        with closing(OrchestratorDB(self.db_path)) as db:
-            for kind, (name, res_list) in CATALOG.items():
-                # Проверяем, есть ли уже бизнес-процесс
-                existing = db.get_business_process_by_name(name)
-                if not existing:
-                    bp_id = db.create_business_process(name, kind, {"version": 1})
-                    # Создаём этап для каждого процесса
-                    stage_resources = json.dumps([
-                        {"resource_id": r[0], "mode": r[1], "granularity": "partition"}
-                        for r in res_list
-                    ])
-                    db.create_stage(bp_id, "calculation", stage_resources, None, 4, 10)
+        with closing(OrchestratorDB(self.db_path)) as db, db.transaction():
+            for kind,(name,resources) in CATALOG.items():
+                bp = db.get_business_process_by_name(name)
+                pid = bp["business_process_id"] if bp else db.create_business_process(name,kind,[])
+                stages = db.get_stages(pid)
+                specs = list(resources)
+                if kind in ("P1","P2"):
+                    specs.append(("reference","R"))
+                locks = [dict(resource_id=n,granularity="table" if n=="reference" else "partition",
+                              mode="read" if m=="R" else "write") for n,m in specs]
+                if not stages:
+                    calc = db.create_stage(pid,"calculation",json.dumps(locks),None,4,10)
+                elif len(stages)==1 and stages[0]["stage_type"]=="calculation":
+                    calc = stages[0]["stage_id"]
+                    db.conn.execute("UPDATE stage SET required_resources=? WHERE stage_id=?", (json.dumps(locks),calc))
+                else:
+                    continue
+                review = db.create_stage(pid,"approval","[]",json.dumps([calc]),None,10)
+                sign = db.create_stage(pid,"sign-off","[]",json.dumps([review]),None,10)
+                db.update_business_process(pid,name,kind,[calc,review,sign])
+            if db.conn.execute("SELECT 1 FROM sqlite_master WHERE name='ledger' AND type='table'").fetchone():
+                from .legacy import migrate
+                migrate(db)
 
     @contextmanager
     def tx(self):
-        """Контекстный менеджер транзакции (совместимость со старым API)."""
-        db = OrchestratorDB(self.db_path)
-        try:
+        with closing(OrchestratorDB(self.db_path,initialize=False)) as db, db.transaction():
             yield db
-        finally:
-            db.close()
 
     def snapshot(self):
-        """Возвращает состояние в формате, совместимом со старым API."""
-        with closing(OrchestratorDB(self.db_path)) as db:
-            # Собираем jobs из run + stage_request + bp_request
-            runs = db.get_all_runs_with_context()
-            jobs = []
-            for run in runs:
-                job = {
-                    "id": run["run_id"],
-                    "kind": run["bp_name"],  # маппинг: bp_name → kind
-                    "day": run["date"],
-                    "factor": 1,  # для MVP
-                    "resources": json.loads(run["required_resources"]),
-                    "parent": run["parent_run_id"] or 0,
-                    "route": 1,
-                    "approval": run["stage_type"] in ("approval", "sign-off"),
-                    "channel": run["initiator_type"],
-                    "actor": run["initiator_id"],
-                    "status": self._map_run_status(run["run_status"]),
-                    "created": run["created_at"],
-                    "start": run["started_at"],
-                    "end": run["finished_at"],
-                    "attempt": 1,
-                    "token": None,  # в новой модели token не используется
-                    "lease": run["lease_expires_at"],
-                    "inputs": {},  # заполняется при claim
-                    "result": run.get("result_payload"),
-                    "reason": run.get("waiting_for", ""),
-                    "rerun": False,
-                    "wait_for": None,
-                }
-                jobs.append(job)
+        with closing(OrchestratorDB(self.db_path,initialize=False)) as db:
+            db.conn.execute("BEGIN")
+            return snapshot(db)
 
-            # Собираем requests из bp_request
-            bp_requests = db.get_all_bp_requests()
-            requests = [
-                {
-                    "key": br["input_hash"],
-                    "signature": [br["business_process_id"], br["date"], 1, br["initiator_id"], br["initiator_type"], False, False, 0, False],
-                    "job": br["bp_request_id"],
-                    "actor": br["initiator_id"],
-                    "channel": br["initiator_type"],
-                }
-                for br in bp_requests
-            ]
+    def submit(self,data):
+        with self.tx() as db:
+            return self.add(db,data)
 
-            # Собираем events
-            events = db.get_recent_events(1000)
-            events_formatted = [
-                {
-                    "seq": e["event_id"],
-                    "at": e["timestamp"],
-                    "job": e["entity_id"],
-                    "message": e["payload"] if e["payload"] else e["event_type"],
-                }
-                for e in events
-            ]
-
-            return {
-                "jobs": jobs,
-                "requests": requests,
-                "results": {},  # в новой модели результаты хранятся в run
-                "heads": {},  # в новой модели публикации отслеживаются через run
-                "events": events_formatted,
-                "signals": {},  # внешние события хранятся в run.external_event
-                "demo_batches": [],  # для MVP не используем
-                "schedule": None,  # для MVP не используем
-            }
-
-    def _map_run_status(self, run_status):
-        """Маппинг статусов run на статусы старого API."""
-        mapping = {
-            "queued": "queued",
-            "waiting_resource": "queued",
-            "running": "running",
-            "waiting_external": "review",
-            "done": "done",
-            "failed": "failed",
-            "cancelled": "cancelled",
-        }
-        return mapping.get(run_status, "queued")
-
-    def submit(self, data):
-        """Создаёт заявку на бизнес-процесс."""
-        answer = Future()
-        with self.inbox_lock:
-            first = not self.inbox
-            self.inbox.append((data, answer))
-        if first:
-            time.sleep(0.015)
-            with self.inbox_lock:
-                batch, self.inbox = self.inbox, []
-            outcomes = []
-            try:
-                with closing(OrchestratorDB(self.db_path)) as db:
-                    for request, pending in batch:
-                        try:
-                            jid = self._add(db, request)
-                            outcomes.append((pending, jid, None))
-                        except (ValueError, TypeError, KeyError) as err:
-                            outcomes.append((pending, None, err))
-            except Exception as err:
-                outcomes = [(pending, None, err) for _, pending in batch]
-            for pending, value, error in outcomes:
-                if error is None:
-                    pending.set_result(value)
-                else:
-                    pending.set_exception(error)
-        return answer.result()
-
-    def _add(self, db, data):
-        """Внутренний метод создания заявки."""
-        kind = data["kind"]
-        day = date.fromisoformat(data["day"]).isoformat()
-        factor = int(data.get("factor", 1))
-        actor = str(data.get("actor", "")).strip()
-        channel = data.get("channel", "manual")
-
-        if kind not in CATALOG:
-            raise ValueError("Процесс не найден.")
-        if not actor or len(actor) > 80:
-            raise ValueError("Некорректный инициатор.")
-
-        # Находим business_process
+    def add(self,db,data):
+        kind,day = data["kind"],date.fromisoformat(data["day"]).isoformat()
+        actor,channel = str(data.get("actor","")).strip(),data.get("channel","manual")
+        factor = int(data.get("factor",1))
+        if kind not in CATALOG or not actor or len(actor)>80 or channel not in ("manual","schedule") or not 1<=factor<=10:
+            raise ValueError("Проверьте параметры запуска.")
+        parent = int(data.get("parent") or 0)
+        if parent and not db.get_stage_requests_by_bp_request(parent):
+            raise ValueError("Предшественник не найден.")
+        key = data.get("key") or uuid.uuid4().hex
+        params = dict(factor=factor,approval=bool(data.get("approval")),parent=parent,
+                      shared=bool(data.get("shared")),rerun=bool(data.get("rerun")))
+        signature = [kind,day,actor,channel,params.copy()]
+        prior = db.conn.execute("SELECT payload FROM event WHERE event_type='request_received' AND json_extract(payload,'$.key')=?",(key,)).fetchone()
+        if prior:
+            saved = json.loads(prior[0])
+            if saved["signature"] != signature:
+                raise ValueError("Ключ обращения уже использован с другими параметрами.")
+            return saved["job"]
+        if params["rerun"]:
+            params["rerun_key"] = key
         bp = db.get_business_process_by_name(CATALOG[kind][0])
-        if not bp:
-            raise ValueError("Бизнес-процесс не найден.")
+        receipt = db.create_bp_request(bp["business_process_id"],day,channel,actor,params)
+        jid = receipt["id"]
+        if not receipt["merged"]:
+            Expand(db).expand_bp_request(jid)
+        db.log_event("request_received","bp_request",jid,dict(job=jid,key=key,signature=signature,channel=channel,
+            message=("Присоединено обращение" if receipt["merged"] else "Принято обращение")+" · "+actor),actor)
+        return jid
 
-        # Создаём bp_request
-        payload = {"factor": factor, "shared": bool(data.get("shared")), "rerun": bool(data.get("rerun"))}
-        result = db.create_bp_request(
-            bp["business_process_id"], day, channel, actor, payload
-        )
+    def schedule(self,data):
+        plan = {"enabled":False}
+        if data.get("enabled"):
+            period = int(data["period"])
+            if not 5 <= period <= 3600 or data["kind"] not in CATALOG:
+                raise ValueError("Проверьте параметры расписания.")
+            plan = dict(kind=data["kind"],day=date.fromisoformat(data["day"]).isoformat(),period=period,due=time.time()+period)
+        with self.tx() as db:
+            db.log_event("schedule_changed","system",0,plan)
 
-        # Разворачиваем в stage_request
-        from backend.orchestrator.expand import Expand
-        expand = Expand(db)
-        expand.expand_bp_request(result["id"])
+    def queue_revision(self):
+        with closing(OrchestratorDB(self.db_path,initialize=False)) as db:
+            return db.conn.execute("SELECT COALESCE(MAX(event_id),0) FROM event").fetchone()[0]
 
-        return result["id"]
+    def claim(self,maintenance=False):
+        with self.tx() as db:
+            row = db.conn.execute("SELECT payload FROM event WHERE event_type IN ('schedule_changed','schedule_fired') ORDER BY event_id DESC LIMIT 1").fetchone()
+            plan = json.loads(row[0]) if row else {}
+            if plan.get("due",float("inf")) <= time.time():
+                self.add(db,dict(**plan,actor="Регламент",channel="schedule"))
+                plan["due"] = time.time()+plan["period"]
+                db.log_event("schedule_fired","system",0,plan)
+            return sweep_queue(db,maintenance)
 
-    def claim(self):
-        """Выбирает заявки для выполнения."""
-        with closing(OrchestratorDB(self.db_path)) as db:
-            # Находим stage_request в статусе created/queued
-            pending = db.get_pending_stage_requests(100)
-            started = []
+    def _owned_run(self,db,jid,token):
+        return db.conn.execute("""SELECT r.* FROM run r JOIN stage_request sr USING(stage_request_id)
+            WHERE r.run_id=? AND sr.bp_request_id=? AND r.status='running'
+            AND r.lease_expires_at>datetime('now')""",(token,jid)).fetchone()
 
-            for sr in pending:
-                # Проверяем зависимости
-                all_done, unfinished = db.check_dependencies(sr["stage_request_id"])
-                if not all_done:
-                    db.update_stage_request_status(
-                        sr["stage_request_id"], "waiting_dependency",
-                        {"type": "dependency", "ids": unfinished}
-                    )
-                    continue
+    def heartbeat(self,jid,token):
+        with self.tx() as db:
+            return bool(self._owned_run(db,jid,token) and db.update_heartbeat(int(token)))
 
-                # Проверяем ресурсы
-                stage = db.get_stage(sr["stage_id"])
-                required_resources = json.loads(stage["required_resources"] or "[]")
-                
-                # Проверяем конфликты
-                conflicts = []
-                for resource in required_resources:
-                    active_locks = db.get_active_locks(resource["resource_id"], sr["date"])
-                    for lock in active_locks:
-                        if not (lock["mode"] == "read" and resource["mode"] == "read"):
-                            conflicts.append(lock)
+    def publish(self,jid,token,result=None):
+        with self.tx() as db:
+            if self._owned_run(db,jid,token):
+                Release(db).release_run(int(token),"done")
+                for sr in db.get_stage_requests_by_bp_request(jid):
+                    if sr["status"] == "queued" and db.get_stage(sr["stage_id"])["stage_type"] in ("approval","sign-off"):
+                        Admit(db).one(sr["stage_request_id"])
+                return jid
+            done = db.conn.execute("""SELECT 1 FROM run JOIN stage_request USING(stage_request_id)
+                WHERE run_id=? AND bp_request_id=? AND run.status='done'""",(token,jid)).fetchone()
+            return jid if done else None
 
-                if conflicts:
-                    db.update_stage_request_status(
-                        sr["stage_request_id"], "waiting_resource",
-                        {"type": "resource", "conflicts": conflicts}
-                    )
-                    continue
+    def _rerun(self,db,jid):
+        b = db.conn.execute("""SELECT b.*,p.risk_type FROM bp_request b JOIN business_process p
+            USING(business_process_id) WHERE bp_request_id=?""",(jid,)).fetchone()
+        params = json.loads(b["input_payload"])
+        params.update(kind=b["risk_type"],day=b["date"],actor=b["initiator_id"],rerun=True)
+        return self.add(db,params)
 
-                # Захватываем ресурсы
-                locks = [
-                    {
-                        "resource_id": r["resource_id"],
-                        "granularity": r.get("granularity", "partition"),
-                        "data_key": sr["date"],
-                        "mode": r["mode"],
-                    }
-                    for r in required_resources
-                ]
+    def external(self,run_id,actor,decision,event_id,comment=""):
+        with self.tx() as db:
+            return receive_signal(db,run_id,actor,decision,event_id,comment,lambda j:self._rerun(db,j))
 
-                if not db.acquire_locks(sr["stage_request_id"], locks):
-                    continue
-
-                # Создаём run
-                run_id = db.create_run(sr["stage_request_id"])
-                db.update_run_status(run_id, "running", started_at=time.time())
-                db.update_heartbeat(run_id)
-
-                # Собираем job для worker
-                bp = db.get_business_process(stage["business_process_id"])
-                job = {
-                    "id": run_id,
-                    "kind": bp["risk_type"],
-                    "day": sr["date"],
-                    "factor": 1,
-                    "resources": [[r["resource_id"], sr["date"], r["mode"]] for r in required_resources],
-                    "parent": 0,
-                    "route": 1,
-                    "approval": stage["stage_type"] in ("approval", "sign-off"),
-                    "channel": "manual",
-                    "actor": "system",
-                    "status": "running",
-                    "created": sr["submitted_at"],
-                    "start": time.time(),
-                    "end": None,
-                    "attempt": 1,
-                    "token": str(run_id),
-                    "lease": time.time() + LEASE_SECONDS,
-                    "inputs": read_inputs(db, {"resources": [[r["resource_id"], sr["date"], r["mode"]] for r in required_resources]}),
-                    "result": None,
-                    "reason": "",
-                    "rerun": False,
-                    "wait_for": None,
-                }
-                started.append(job)
-
-            return started
-
-    def heartbeat(self, jid, token):
-        """Обновляет heartbeat для запуска."""
-        with closing(OrchestratorDB(self.db_path)) as db:
-            return db.update_heartbeat(jid)
-
-    def publish(self, run_id: int, token: str, result: dict) -> str:
-        """Фиксирует факт завершения запуска."""
-        with closing(OrchestratorDB(self.db_path)) as db:
-            run = db.get_run_by_id(run_id)
-            if not run or run["status"] != "running":
-                return None
-            
-            db.update_run_status(run_id, "done", finished_at=time.time())
-            db.release_locks(run_id)
-            db.log_event("run_done", "run", run_id, 
-                        {"rows_count": result.get("rows_count", 0)}, "system")
-            
-            # Будим детей
-            sr = db.get_run_by_stage_request(run_id)
-            if sr:
-                db.wake_children(sr["stage_request_id"])
-            
-            return str(run_id)
-
-    def decide(self, jid, decision, actor, event_id, comment="", version=None):
-        """Обрабатывает решение по согласованию."""
-        if decision not in ("approve", "reject"):
-            raise ValueError("Некорректное решение.")
-
-        with closing(OrchestratorDB(self.db_path)) as db:
-            run = db.conn.execute(
-                "SELECT * FROM run WHERE run_id = ?", (jid,)
-            ).fetchone()
-
-            if not run:
-                raise ValueError("Запуск не найден.")
-
-            if run["status"] != "waiting_external":
-                raise ValueError("Запуск не в статусе ожидания согласования.")
-
-            # Обновляем external_event
-            external_event = {
-                "actor": actor,
-                "decision": decision,
-                "comment": comment,
-                "received_at": time.time(),
-            }
-            db.update_run_external_event(jid, external_event)
-
-            if decision == "approve":
-                db.update_run_status(jid, "done", finished_at=time.time())
+    def decide(self,jid,decision,actor,event_id,comment="",version=None):
+        with self.tx() as db:
+            old = previous_signal(db,event_id)
+            if old:
+                if old["job"]!=jid:
+                    raise ValueError("ID события уже использован.")
+                rid = old["run_id"]
             else:
-                db.update_run_status(jid, "failed", finished_at=time.time())
+                waiting = db.get_runs_waiting_external(jid)
+                if not waiting:
+                    raise ValueError("Запуск не ожидает решения.")
+                rid = waiting[0]["run_id"]
+            return receive_signal(db,rid,actor,decision,event_id,comment,lambda j:self._rerun(db,j))["successor"]
 
-            db.release_locks(jid)
-            db.log_event("external_signal", "run", jid, external_event, actor)
+    def control(self,jid,action):
+        with self.tx() as db:
+            b = db.conn.execute("SELECT status FROM bp_request WHERE bp_request_id=?",(jid,)).fetchone()
+            if not b or action!="cancel" or b[0] not in ("pending","expanded","running"):
+                raise ValueError("Действие недоступно.")
+            for sr in db.get_stage_requests_by_bp_request(jid):
+                run = db.get_run_by_stage_request(sr["stage_request_id"])
+                if run and run["status"]=="running":
+                    Release(db).release_run(run["run_id"],"cancelled")
+                elif not run:
+                    db.update_stage_request_status(sr["stage_request_id"],"cancelled")
+            db.conn.execute("UPDATE bp_request SET status='cancelled' WHERE bp_request_id=?",(jid,))
+            db.log_event("run_cancelled","bp_request",jid,{"message":"Остановлен оператором"})
 
-            return None
-
-    def control(self, jid, action):
-        """Управляет запуском (отмена, сбой)."""
-        with closing(OrchestratorDB(self.db_path)) as db:
-            run = db.conn.execute(
-                "SELECT * FROM run WHERE run_id = ?", (jid,)
-            ).fetchone()
-
-            if not run:
-                raise ValueError("Запуск не найден.")
-
-            if action == "cancel" and run["status"] in ("queued", "running"):
-                db.update_run_status(jid, "cancelled", finished_at=time.time())
-                db.release_locks(jid)
-                db.log_event("run_cancelled", "run", jid, {"reason": "Остановлен оператором"}, "system")
-            elif action == "fault" and run["status"] == "running":
-                db.update_run_status(jid, "failed", finished_at=time.time())
-                db.release_locks(jid)
-                db.log_event("run_failed", "run", jid, {"reason": "Демонстрационный сбой"}, "system")
-            else:
-                raise ValueError("Действие недоступно в текущем состоянии.")
-
-    def execution_error(self, jid, token, error):
-        """Обрабатывает ошибку исполнения."""
-        with closing(OrchestratorDB(self.db_path)) as db:
-            db.update_run_status(jid, "failed", finished_at=time.time())
-            db.release_locks(jid)
-            db.log_event("run_failed", "run", jid, {"error": str(error)}, "system")
+    def execution_error(self,jid,token,error):
+        with self.tx() as db:
+            if self._owned_run(db,jid,token):
+                Release(db).release_run(int(token),"failed")
+                db.log_event("run_failed","bp_request",jid,{"message":"Ошибка исполнителя: "+str(error)})

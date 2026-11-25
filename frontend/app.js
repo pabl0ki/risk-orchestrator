@@ -17,10 +17,14 @@ const labels = {
   failed: "Ошибка",
   cancelled: "Отменён",
 };
-const stamp = (n) =>
+function eventText(event) {
+  const message = event.message.replace(/^(Передано на согласование|Опубликовано) v\d+\.\d+(?= · ресурсы освобождены$)/, "$1");
+  return escapeHtml(message);
+}
+const stamp = (n, milliseconds = true) =>
   n
     ? new Date(n * 1000).toLocaleTimeString("ru-RU", {
-        fractionalSecondDigits: 3,
+        fractionalSecondDigits: milliseconds ? 3 : undefined,
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit",
@@ -103,14 +107,14 @@ function showScenario(batch){
     const finishAt=finish(j)||end;
     const execution=j.start?`<i class="execution" style="left:${pct(j.start)}%;width:${Math.max(0,pct(finishAt)-pct(j.start))}%"></i>`:"";
     const bar=`<div class="interval" aria-hidden="true"><i class="waiting" style="left:${pct(j.created)}%;width:${Math.max(0,pct(j.start||finishAt)-pct(j.created))}%"></i>${execution}</div>`;
-    return [jobLink(j),state.catalog[j.kind],j.day,badge(j),j.parent?"RUN-"+j.parent:"—",bar,waitingReason(j,j.status==="queued"?j.reason:reasons.get(j.id)||"—"),j.result||"—"];
+    return [jobLink(j),state.catalog[j.kind],j.day,badge(j),j.parent?"RUN-"+j.parent:"—",bar,waitingReason(j,j.status==="queued"?j.reason:reasons.get(j.id)||"—")];
   });
   return `<div class="pad"><h2>${state.scenarios[batch.scenario][0]}</h2><p class="lead">${state.scenarios[batch.scenario][1]}</p>
     <p class="batchstats">Заявки <b>${batch.requests}</b> · Запуски <b>${jobs.length}</b> · В очереди <b>${jobs.filter(j=>j.status==="queued").length}</b> · Выполняются <b>${jobs.filter(j=>j.status==="running").length}</b> · Завершены <b>${done}/${jobs.length}</b></p>
     <div class="legend"><span>Ожидание</span><span>Расчёт</span><small>Общая шкала от 0 до ${duration.toFixed(1)} с${active?" · в реальном времени":""}</small></div></div>`+
-    table(["Запуск","Процесс","Дата","Статус","Зависит от","Ход выполнения","Причина последнего ожидания","Версия"],rows)+
+    table(["Запуск","Процесс","Дата","Статус","Зависит от","Ход выполнения","Причина последнего ожидания"],rows)+
     `<div class="pad"><h3>Журнал партии</h3></div>`+
-    table(["№","От старта","Запуск","Операция"],events.slice().reverse().map(e=>[e.seq,Math.max(0,e.at-origin).toFixed(2)+" с",jobLink({id:e.job}),escapeHtml(e.message)]));
+    table(["№","От старта","Запуск","Операция"],events.slice().reverse().map(e=>[e.seq,Math.max(0,e.at-origin).toFixed(2)+" с",jobLink({id:e.job}),eventText(e)]));
 }
 function render() {
   const jobs = state.jobs,
@@ -155,15 +159,14 @@ function render() {
   if (tab === "scenarios") html=showScenario(batch);
   else if (tab === "log")
     html = table(
-      ["№", "Время", "Запуск", "Операция"],
+      ["Время", "Запуск", "Операция"],
       state.events
         .slice()
         .reverse()
         .map((e) => [
-          e.seq,
-          stamp(e.at),
+          stamp(e.at, false),
           e.job ? "RUN-" + e.job : "—",
-          escapeHtml(e.message),
+          eventText(e),
         ]),
     );
   else if (tab === "resources")
@@ -187,7 +190,6 @@ function render() {
         "Процесс",
         "Начало расчёта",
         "Конец расчёта",
-        "Версия",
       ],
       jobs
         .filter((j) => j.start)
@@ -195,9 +197,8 @@ function render() {
         .map((j) => [
           jobLink(j),
           state.catalog[j.kind],
-          stamp(j.start),
-          stamp(j.calculated_at || j.end),
-          j.result || "—",
+          stamp(j.start, false),
+          stamp(j.calculated_at || j.end, false),
         ]),
     );
   else
@@ -226,7 +227,7 @@ function render() {
               {
                 pending: "Согласование риск-менеджера",
                 reviewed: "Утверждение директора",
-              }[j.version.approval] ||
+              }[j.approval_status] ||
               "—",
           ),
           `<button data-job="${j.id}">${review ? "Принять решение" : "Детали"}</button>`,
@@ -235,37 +236,13 @@ function render() {
   el("view").innerHTML = html;
   if (el("details").open) renderDetail();
 }
-const number = new Intl.NumberFormat("ru-RU", {maximumFractionDigits: 2});
 function approvalView(j) {
-  const a = j.assessment;
-  if (!a) return "<p>Чтобы загрузить сводку согласования, перезапустите сервер этапа 4.</p>";
   const director = state.role === "director";
-  const indicator = {P1:"Кредитный риск",P2:"Рыночный риск",Z1:"Значения сделок",Z2:"Значения курсов",FX:"Значения справочника"}[j.kind];
-  const measure = label => `<div class="approval-fact"><small>${label}</small>`;
-  const delta = a.previous_total === null ? null : a.total - a.previous_total;
-  let html = `<p class="approval-context">${director?"Утверждение к публикации":"Проверка расчёта"} · Бизнес-дата <b>${escapeHtml(j.day)}</b> · Инициатор ${escapeHtml(j.actor)}</p>
-    <div class="approval-grid">
-      ${measure(indicator+" · сумма по строкам")}<b>${number.format(a.total)} усл. ед.</b></div>
-      ${measure("Версия результата")}<b>${escapeHtml(j.result)}</b></div>
-      ${measure("Обработано строк")}<b>${a.count}</b></div>
-      ${measure("Изменение к предыдущей публикации")}<b>${delta===null?"Первая публикация":(delta>0?"+":"")+number.format(delta)+" усл. ед."}</b>${delta===null?"":`<small>К версии ${escapeHtml(a.previous_id)}</small>`}</div>
-    </div>
-    <p class="approval-check">${escapeHtml(a.block_reason || "Входные версии актуальны. Построчная сверка пройдена.")}</p>`;
-  if (director) {
-    return html+`<h3 class="sectionlabel">Заключение риск-менеджера</h3>
-      <p>${a.reviewed_by?`Версия ${escapeHtml(j.result)} согласована.`:"Согласование отсутствует."}</p>
-      <p class="muted">${a.comment?`Комментарий: ${escapeHtml(a.comment)}`:"Комментарий к согласованию не добавлен."}</p>
-      <p class="approval-note">После утверждения эта версия станет опубликованным результатом за ${escapeHtml(j.day)}.</p>`;
-  }
-  const sources = Object.entries(a.source_rows);
-  const formulas = {P1:"Сделки × Курсы + Справочник",P2:"|Сделки − Курсы| × Справочник"};
-  const formula = formulas[j.kind] || "Сумма входных значений + номер строки";
-  html+=`<h3 class="sectionlabel">Проверка синтетических данных</h3>
-    <p>Расчёт строки: (${formula}) × ${number.format(j.factor)}.</p>
-    ${table(["Строка",...sources.map(([k])=>state.labels[k]),"Результат, усл. ед."],
-      j.version.rows.map((v,i)=>[i+1,...sources.map(([,rows])=>number.format(rows[i])),number.format(v)]))}
-    <p class="approval-note">Входные версии: ${Object.entries(j.inputs).map(([k,v])=>`${state.labels[k]} — ${escapeHtml(v)}`).join("; ")}.</p>`;
-  return html;
+  const context = `<p class="approval-context">${director ? "Утверждение к публикации" : "Согласование расчёта"} · Бизнес-дата <b>${escapeHtml(j.day)}</b> · Инициатор ${escapeHtml(j.actor)}</p>`;
+  if (!director) return context;
+  const comment = j.assessment.comment;
+  return context + `<h3 class="sectionlabel">Заключение риск-менеджера</h3><p>Расчёт согласован.</p>` +
+    (comment ? `<p>Комментарий: ${escapeHtml(comment)}</p>` : "");
 }
 function renderDetail() {
   const j = state.jobs.find((x) => x.id === selected);
@@ -281,16 +258,13 @@ function renderDetail() {
   if (reviewRole()) {
     el("jobBody").innerHTML = links + approvalView(j);
     const approve = el("decision").querySelector('[data-decision="approve"]');
-    approve.textContent = state.role === "director" ? "Утвердить к публикации" : "Согласовать версию";
-    approve.disabled = !j.assessment || Boolean(j.assessment.block_reason);
+    approve.textContent = state.role === "director" ? "Утвердить к публикации" : "Согласовать расчёт";
     return;
   }
   const events = state.events.filter((e) => e.job === j.id);
   el("jobBody").innerHTML = links +
     `${badge(j)} <small>${j.day} · Инициатор: ${escapeHtml(j.actor)}</small>
  ${j.subscribers.length ? `<p>Подписчики результата: ${j.subscribers.map(escapeHtml).join(", ")}</p>` : ""}
- <h3 class="sectionlabel">Версия и результат</h3><p>${j.result ? escapeHtml(j.result) + " · " + j.version.rows.join(" · ") : "Расчёт ещё не завершён"}</p>
- <p class="muted">${Object.values(j.inputs).map(escapeHtml).join(" · ")}</p>
  <h3 class="sectionlabel">Области доступа</h3>${table(
    ["Ресурс", "Область", "Режим"],
    j.resources.map(([k, d, m]) => [
@@ -301,7 +275,7 @@ function renderDetail() {
  )}
  <h3 class="sectionlabel">Порядок операций</h3>${table(
    ["№", "Время", "Событие"],
-   events.map((e) => [e.seq, stamp(e.at), escapeHtml(e.message)]),
+   events.map((e) => [e.seq, stamp(e.at), eventText(e)]),
  )}
  ${state.role === "admin" && ["queued", "running"].includes(j.status) ? '<button class="danger sp" id="cancel">Отменить запуск</button>' : ""}`;
 }
@@ -407,7 +381,6 @@ document.addEventListener("click", (e) => {
       const j = state.jobs.find((x) => x.id === selected);
       const result = await api(`jobs/${selected}/decision`, {
         decision: b.dataset.decision,
-        version: j.result,
         key: crypto.randomUUID(),
         comment: el("comment").value,
       });

@@ -1,107 +1,51 @@
-"""Модуль разворачивания bp_request в stage_request."""
-from backend.database.connection import OrchestratorDB
-from backend.database.utils import validate_dag, calculate_hash
+"""Expand a process template into a DAG of requests in one transaction."""
+import json
+from backend.database.utils import calculate_hash, validate_dag
 
 
 class Expand:
-    """Разворачивает заявку на бизнес-процесс в заявки на этапы."""
-
-    def __init__(self, db: OrchestratorDB):
+    def __init__(self, db):
         self.db = db
 
-    def expand_bp_request(self, bp_request_id: int) -> dict:
-        """
-        Разворачивает bp_request в stage_request для всех этапов маршрута.
-        
-        Возвращает:
-        - {"status": "expanded", "stage_requests": [...]} — успех
-        - {"status": "rejected", "reason": "..."} — ошибка валидации
-        """
-        # 1. Читаем bp_request
-        bp_request = self.db.conn.execute(
-            "SELECT * FROM bp_request WHERE bp_request_id = ?", (bp_request_id,)
-        ).fetchone()
-        
-        if not bp_request:
-            return {"status": "rejected", "reason": "bp_request не найден"}
-        
-        if bp_request["status"] != "pending":
-            return {"status": "rejected", "reason": f"Неверный статус: {bp_request['status']}"}
-        
-        # 2. Читаем бизнес-процесс и его этапы
-        bp = self.db.get_business_process(bp_request["business_process_id"])
-        if not bp:
-            return {"status": "rejected", "reason": "Бизнес-процесс не найден"}
-        
-        stages = self.db.get_stages(bp["business_process_id"])
-        if not stages:
-            return {"status": "rejected", "reason": "Нет этапов в маршруте"}
-        
-        # 3. Валидируем DAG
-        is_valid, error = validate_dag(stages)
-        if not is_valid:
-            # Отклоняем bp_request
-            self.db.conn.execute(
-                "UPDATE bp_request SET status = 'rejected', merged_into_bp_request_id = NULL WHERE bp_request_id = ?",
-                (bp_request_id,)
-            )
-            self.db.log_event(
-                "bp_request_rejected", "bp_request", bp_request_id,
-                {"reason": error}, "system"
-            )
-            return {"status": "rejected", "reason": error}
-        
-        # 4. Создаём stage_request для каждого этапа (жадно)
-        stage_requests = []
-        for stage in stages:
-            # Определяем родителей
-            depends_on = stage.get("depends_on_stages") or []
-            parent_stage_request_ids = []
-            
-            if depends_on:
-                # Находим stage_request для каждого родителя
-                for parent_stage_id in depends_on:
-                    parent_sr = self.db.conn.execute(
-                        """SELECT stage_request_id FROM stage_request 
-                           WHERE bp_request_id = ? AND stage_id = ?""",
-                        (bp_request_id, parent_stage_id)
-                    ).fetchone()
-                    if parent_sr:
-                        parent_stage_request_ids.append(parent_sr["stage_request_id"])
-            
-            # Считаем хэш для этапа (payload наследуется от bp_request)
-            input_hash = calculate_hash(
-                stage["stage_id"], 
-                bp_request["date"], 
-                bp_request["input_payload"]
-            )
-            
-            # Создаём stage_request
-            sr_id = self.db.create_stage_request(
-                bp_request_id=bp_request_id,
-                stage_id=stage["stage_id"],
-                date=bp_request["date"],
-                priority=stage.get("priority_default") or bp_request.get("priority") or 10,
-                input_hash=input_hash,
-                parent_stage_request_ids=parent_stage_request_ids if parent_stage_request_ids else None
-            )
-            
-            stage_requests.append({
-                "stage_request_id": sr_id,
-                "stage_id": stage["stage_id"],
-                "status": "created" if not parent_stage_request_ids else "waiting_dependency"
-            })
-        
-        # 5. Обновляем статус bp_request
-        self.db.conn.execute(
-            "UPDATE bp_request SET status = 'expanded' WHERE bp_request_id = ?",
-            (bp_request_id,)
-        )
-        
-        # 6. Логируем событие
-        self.db.log_event(
-            "bp_request_expanded", "bp_request", bp_request_id,
-            {"stage_requests": len(stage_requests)}, "system"
-        )
-        
-        return {"status": "expanded", "stage_requests": stage_requests}
+    def expand_bp_request(self, bp_request_id):
+        with self.db.transaction():
+            db = self.db
+            row = db.conn.execute("SELECT * FROM bp_request WHERE bp_request_id=?", (bp_request_id,)).fetchone()
+            if not row:
+                raise ValueError("Заявка не найдена.")
+            if row["status"] != "pending":
+                return {"status": row["status"], "stage_requests": db.get_stage_requests_by_bp_request(bp_request_id)}
+            params = json.loads(row["input_payload"] or "{}")
+            stages = [dict(stage) for stage in db.get_stages(row["business_process_id"])]
+            route = json.loads(db.get_business_process(row["business_process_id"])["route"] or "[]")
+            if isinstance(route,list) and route:
+                by_id = {s["stage_id"]:s for s in stages}
+                stages = [by_id[sid] for sid in route] if all(sid in by_id for sid in route) else []
+            for stage in stages:
+                stage["depends_on_stages"] = json.loads(stage["depends_on_stages"] or "[]")
+            valid, error = validate_dag(stages)
+            if not valid or not stages:
+                reason = "circular_dependency" if error and "циклическая зависимость" in error else "invalid_route"
+                db.conn.execute("UPDATE bp_request SET status='rejected' WHERE bp_request_id=?", (bp_request_id,))
+                db.log_event("bp_request_rejected","bp_request",bp_request_id,{"reason":reason})
+                return {"status":"rejected","reason":reason}
+
+            if params.get("approval") is False:
+                stages = [s for s in stages if s["stage_type"] not in ("approval","sign-off")]
+            created = {}
+            pending = {s["stage_id"]:s for s in stages}
+            while pending:
+                for sid, stage in list(pending.items()):
+                    parents = stage["depends_on_stages"]
+                    if any(parent in pending for parent in parents):
+                        continue
+                    dependencies = [created[parent] for parent in parents if parent in created]
+                    if not dependencies and params.get("parent"):
+                        previous = db.get_stage_requests_by_bp_request(params["parent"])
+                        dependencies.extend(s["stage_request_id"] for s in previous)
+                    stage_params = params if stage["stage_type"] not in ("approval","sign-off") else dict(params, subject=bp_request_id)
+                    created[sid] = db.create_stage_request(bp_request_id,sid,row["date"],
+                        stage["priority_default"] or 10, calculate_hash(sid,row["date"],stage_params),dependencies)
+                    del pending[sid]
+            db.conn.execute("UPDATE bp_request SET status='expanded' WHERE bp_request_id=?", (bp_request_id,))
+            return {"status":"expanded","stage_requests":db.get_stage_requests_by_bp_request(bp_request_id)}

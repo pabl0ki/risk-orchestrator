@@ -356,8 +356,8 @@ def test_engine_migrates_legacy_events_once(tmp_path):
     engine = Engine(path)
     engine.submit(dict(kind="P1", day="2026-11-22", actor="Анна"))
     events = Engine(path).snapshot()["events"]
-    assert events[0] == entry
+    assert events[0]["message"] == entry["message"] and events[0]["at"] == entry["at"]
     assert [event["seq"] for event in events] == [1, 2]
     with closing(OrchestratorDB(path)) as db:
-        assert [json.loads(row["payload"]) for row in reversed(db.get_recent_events())] == events
-        assert "events" not in json.loads(db.conn.execute("SELECT payload FROM ledger").fetchone()[0])
+        assert list(tmp_path.glob("old-before-relational-*.sqlite3"))
+        assert not db.conn.execute("SELECT 1 FROM sqlite_master WHERE name='ledger'").fetchone()
