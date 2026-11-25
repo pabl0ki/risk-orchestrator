@@ -120,7 +120,10 @@ def create_app(database, duration):
             j["inputs"] = {k:v["id"] for k,v in j["inputs"].items()}
             j["version"] = snapshot["results"].get(j["result"], {}).copy()
             j["version"].pop("token", None)
-            j["initiators"] = [r["actor"] for r in snapshot["requests"] if r["job"] == j["id"]]
+            actors = [r["actor"] for r in snapshot["requests"] if r["job"] == j["id"]]
+            j["initiators"] = [j["actor"]]
+            j["subscribers"] = list(dict.fromkeys(actor for actor in actors if actor != j["actor"]))
+            j["request_count"] = len(actors)
         return dict(jobs=jobs, role=role(request), worker_alive=request.app.state.worker.is_alive(),
                     catalog={k:v[0] for k,v in CATALOG.items()},
                     scenarios=SCENARIOS if role(request)=="admin" else {},

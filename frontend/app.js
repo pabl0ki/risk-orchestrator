@@ -206,7 +206,7 @@ function render() {
         "Запуск",
         "Процесс",
         "Бизнес-дата",
-        "Инициаторы",
+        "Инициатор",
         "Статус",
         "Причина ожидания / этап",
         "Действия",
@@ -219,7 +219,7 @@ function render() {
           jobLink(j),
           state.catalog[j.kind],
           j.day,
-          j.initiators.map(escapeHtml).join(", "),
+          escapeHtml(j.actor),
           badge(j),
           waitingReason(j,
             j.reason ||
@@ -243,7 +243,7 @@ function approvalView(j) {
   const indicator = {P1:"Кредитный риск",P2:"Рыночный риск",Z1:"Значения сделок",Z2:"Значения курсов",FX:"Значения справочника"}[j.kind];
   const measure = label => `<div class="approval-fact"><small>${label}</small>`;
   const delta = a.previous_total === null ? null : a.total - a.previous_total;
-  let html = `<p class="approval-context">${director?"Утверждение к публикации":"Проверка расчёта"} · Бизнес-дата <b>${escapeHtml(j.day)}</b> · Инициатор ${j.initiators.map(escapeHtml).join(", ")}</p>
+  let html = `<p class="approval-context">${director?"Утверждение к публикации":"Проверка расчёта"} · Бизнес-дата <b>${escapeHtml(j.day)}</b> · Инициатор ${escapeHtml(j.actor)}</p>
     <div class="approval-grid">
       ${measure(indicator+" · сумма по строкам")}<b>${number.format(a.total)} усл. ед.</b></div>
       ${measure("Версия результата")}<b>${escapeHtml(j.result)}</b></div>
@@ -287,7 +287,8 @@ function renderDetail() {
   }
   const events = state.events.filter((e) => e.job === j.id);
   el("jobBody").innerHTML = links +
-    `${badge(j)} <small>${j.day} · ${j.initiators.map(escapeHtml).join(", ")}</small>
+    `${badge(j)} <small>${j.day} · Инициатор: ${escapeHtml(j.actor)}</small>
+ ${j.subscribers.length ? `<p>Подписчики результата: ${j.subscribers.map(escapeHtml).join(", ")}</p>` : ""}
  <h3 class="sectionlabel">Версия и результат</h3><p>${j.result ? escapeHtml(j.result) + " · " + j.version.rows.join(" · ") : "Расчёт ещё не завершён"}</p>
  <p class="muted">${Object.values(j.inputs).map(escapeHtml).join(" · ")}</p>
  <h3 class="sectionlabel">Области доступа</h3>${table(

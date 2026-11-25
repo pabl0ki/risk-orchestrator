@@ -65,7 +65,9 @@ async function main() {
       live.jobs.map((j) => j.status),
       ["running", "running", "queued"],
     );
-    assert.deepEqual(live.jobs[0].initiators, ["Анна", "Регламент"]);
+    assert.deepEqual(live.jobs[0].initiators, ["Анна"]);
+    assert.deepEqual(live.jobs[0].subscribers, ["Регламент"]);
+    assert.equal(live.jobs[0].request_count, 2);
     await page.click('[data-tab="queue"]');
     await page.getByRole("button",{name:"Сделки · ожидает №1"}).click();
     assert.match(await page.locator("#jobTitle").textContent(), /^RUN-1 ·/);
@@ -123,7 +125,7 @@ async function main() {
     assert.deepEqual(errors, []);
     const report = {
       demoDate: credit.day,
-      requests: live.jobs.flatMap((j) => j.initiators).length,
+      requests: live.jobs.reduce((total, job) => total + job.request_count, 0),
       executions: done.jobs.length,
       sequence: done.jobs.map((j) => ({
         id: j.id,
