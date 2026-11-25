@@ -82,6 +82,8 @@ CREATE TABLE run (
   created_at DATETIME NOT NULL,
   started_at DATETIME,
   finished_at DATETIME,
+  heartbeat_at DATETIME,            -- время последнего пульса (heartbeat)
+  lease_expires_at DATETIME,        -- до какого момента действует аренда запуска
   parent_run_id INTEGER,
   FOREIGN KEY (stage_request_id) REFERENCES stage_request (stage_request_id),
   FOREIGN KEY (parent_run_id) REFERENCES run (run_id)
