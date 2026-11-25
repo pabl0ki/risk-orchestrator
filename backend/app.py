@@ -167,6 +167,18 @@ def create_app(database, duration):
             raise HTTPException(404)
         return FileResponse(FRONTEND / asset)
 
+    @api.post("/api/external-events")
+    def external_event(request: Request, data: dict):
+        """Принимает внешнее событие (согласование/утверждение)."""
+        actor = require(request, "reviewer", "director")
+        if not all(k in data for k in ("run_id", "decision")):
+            raise ValueError("Нужны run_id и decision.")
+        return engine.decide(
+            data["run_id"], data["decision"], actor,
+            data.get("event_id", uuid.uuid4().hex),
+            data.get("comment", ""), data.get("version")
+        )
+
     return api
 
 

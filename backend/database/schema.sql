@@ -139,4 +139,3 @@ CREATE INDEX IF NOT EXISTS event_index_4 ON event (event_type, timestamp);
 -- input_hash в bp_request: ключ дубликатов SHA256(business_process_id + date + norm(input_payload))
 -- input_hash в stage_request: ключ дубликатов SHA256(stage_id + date + norm(input_payload))
 -- route и required_resources в stage: JSON для MVP, отдельные таблицы — задел на будущее
-CREATE TABLE IF NOT EXISTS ledger (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
