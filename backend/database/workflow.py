@@ -8,7 +8,7 @@ STAGES = {
     "calculation": "Расчёт", "approval": "Согласование",
     "sign-off": "Утверждение", "publication": "Публикация",
 }
-PARAMETERS = ("factor", "resources", "parent", "route", "approval", "rerun")
+PARAMETERS = ("factor", "resources", "parent", "approval", "rerun")
 BP_STATUS = {"queued": "expanded", "running": "in_progress", "review": "in_progress",
              "done": "done", "rejected": "rejected", "cancelled": "cancelled", "failed": "failed"}
 
@@ -30,9 +30,9 @@ def read_events(con):
 
 def read_state(con):
     state = dict(jobs=[], requests=[], results={}, heads={}, events=read_events(con),
-                 routes={}, signals={}, schedule=None)
-    for row in con.execute("SELECT code,revision FROM process_route"):
-        state["routes"][row["code"]] = row["revision"]
+                 routes=[], signals={}, schedule=None)
+    for row in con.execute("SELECT code FROM process_route ORDER BY rowid"):
+        state["routes"].append(row["code"])
     jobs = con.execute("""
         SELECT w.*, b.date,b.initiator_type,b.initiator_id,b.input_payload,b.submitted_at,
                b.status,p.code
@@ -44,12 +44,12 @@ def read_state(con):
         if status == "expanded":
             status = "queued"
         elif status == "in_progress":
-            status = "review" if r["result_version"] else "running"
+            status = "review" if r["result_id"] else "running"
         job = dict(json.loads(r["input_payload"]), id=r["public_id"], kind=r["code"],
                    day=r["date"], actor=r["initiator_id"], channel=r["initiator_type"],
                    created=r["submitted_at"], status=status, start=r["start_at"], end=r["end_at"],
                    attempt=r["attempt"], token=r["token"], lease=r["lease"],
-                   inputs=json.loads(r["inputs"]), result=r["result_version"], reason=r["reason"])
+                   inputs=json.loads(r["inputs"]), result=r["result_id"], reason=r["reason"])
         if r["has_wait_for"]:
             job["wait_for"] = r["wait_for"]
         if r["calculated_at"] is not None:
@@ -64,16 +64,16 @@ def read_state(con):
                      j["rerun"], j["parent"], j["approval"]]
         state["requests"].append(dict(key=r["request_key"], signature=signature,
                                       job=j["id"], actor=actor, channel=channel))
-    for r in con.execute("SELECT * FROM result_version ORDER BY rowid"):
-        state["results"][r["version"]] = dict(id=r["version"], object=r["resource"], scope=r["scope"],
-            previous=r["previous"], rows=json.loads(r["rows_json"]), inputs=json.loads(r["inputs"]),
+    for r in con.execute("SELECT * FROM run_result ORDER BY rowid"):
+        state["results"][r["result_id"]] = dict(id=r["result_id"], object=r["resource"], scope=r["scope"],
+            rows=json.loads(r["rows_json"]), inputs=json.loads(r["inputs"]),
             token=r["token"], algorithm=r["algorithm"], factor=r["factor"], approval=r["approval"])
         if r["scope"] is None:
-            del state["results"][r["version"]]["scope"]
-    state["heads"] = dict(con.execute("SELECT resource_key,version FROM published_result"))
+            del state["results"][r["result_id"]]["scope"]
+    state["heads"] = dict(con.execute("SELECT resource_key,result_id FROM published_result"))
     for r in con.execute("SELECT * FROM decision_receipt ORDER BY rowid"):
         state["signals"][r["command_key"]] = [r["public_id"], r["decision"], r["actor"],
-            r["successor"], r["comment"], r["version"]][:r["signature_length"]]
+            r["successor"], r["comment"]][:r["signature_length"]]
     plan = con.execute("SELECT process_code AS kind,business_date AS day,period,due FROM schedule").fetchone()
     if plan:
         state["schedule"] = dict(plan)
@@ -85,11 +85,7 @@ def read_state(con):
     return state
 
 
-def write_route(con, code, revision, catalog):
-    row = con.execute("SELECT business_process_id FROM process_route WHERE code=?", (code,)).fetchone()
-    if row:
-        con.execute("UPDATE process_route SET revision=? WHERE code=?", (revision, code))
-        return
+def write_route(con, code, catalog):
     name, resources = catalog[code]
     pid = con.execute("INSERT INTO business_process(name,risk_type,created_at) VALUES(?,?,CURRENT_TIMESTAMP)",
                       (name, code)).lastrowid
@@ -105,7 +101,7 @@ def write_route(con, code, revision, catalog):
                           (pid,title,stage_type,encode(declarations if not route else []),encode(route[-1:]))).lastrowid
         route.append(sid)
     con.execute("UPDATE business_process SET route=? WHERE business_process_id=?", (encode(route),pid))
-    con.execute("INSERT INTO process_route VALUES(?,?,?)", (code,pid,revision))
+    con.execute("INSERT INTO process_route VALUES(?,?)", (code,pid))
 
 
 def register_request(con, request, job, submitted_at):
@@ -164,7 +160,7 @@ def update_job(con, job, decisions, decision_times):
     bid = con.execute("SELECT bp_request_id FROM workflow WHERE public_id=?", (jid,)).fetchone()[0]
     con.execute("UPDATE bp_request SET submitted_at=?,status=? WHERE bp_request_id=?",
                 (job["created"],BP_STATUS[job["status"]],bid))
-    con.execute("""UPDATE workflow SET attempt=?,token=?,lease=?,inputs=?,result_version=?,reason=?,
+    con.execute("""UPDATE workflow SET attempt=?,token=?,lease=?,inputs=?,result_id=?,reason=?,
         start_at=?,end_at=?,calculated_at=?,wait_for=?,has_wait_for=? WHERE public_id=?""",
         (job["attempt"],job["token"],job["lease"],encode(job["inputs"]),job["result"],job["reason"],
          job["start"],job["end"],job.get("calculated_at"),job.get("wait_for"),"wait_for" in job,jid))
@@ -227,9 +223,9 @@ def sync_locks(con, rid, job):
 
 
 def save_changes(con, old, state, catalog):
-    for code, revision in state["routes"].items():
-        if revision != old["routes"].get(code):
-            write_route(con, code, revision, catalog)
+    for code in state["routes"]:
+        if code not in old["routes"]:
+            write_route(con, code, catalog)
     new_events = state["events"][len(old["events"]):]
     received = {entry["request_key"]:entry["at"] for entry in new_events if "request_key" in entry}
     for request in state["requests"][len(old["requests"]):]:
@@ -245,8 +241,8 @@ def save_changes(con, old, state, catalog):
     for key, receipt in state["signals"].items():
         decisions.setdefault(receipt[0], {})[receipt[2]] = receipt
         if key not in old["signals"]:
-            con.execute("INSERT INTO decision_receipt VALUES(?,?,?,?,?,?,?,?)",
-                        (key, *(receipt+[None]*6)[:6], len(receipt)))
+            con.execute("INSERT INTO decision_receipt VALUES(?,?,?,?,?,?,?)",
+                        (key, *(receipt+[None]*5)[:5], len(receipt)))
     for index, job in enumerate(state["jobs"]):
         if index >= len(old["jobs"]) or job != old["jobs"][index]:
             update_job(con, job, decisions.get(job["id"], {}), decision_times)
@@ -254,15 +250,15 @@ def save_changes(con, old, state, catalog):
     for key, version in state["results"].items():
         if version == old["results"].get(key):
             continue
-        con.execute("""INSERT INTO result_version VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(version) DO UPDATE SET rows_json=excluded.rows_json,approval=excluded.approval""",
-            (key,owners[key],version["object"],version.get("scope"),version.get("previous"),
+        con.execute("""INSERT INTO run_result VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(result_id) DO UPDATE SET rows_json=excluded.rows_json,approval=excluded.approval""",
+            (key,owners[key],version["object"],version.get("scope"),
              encode(version["rows"]),encode(version["inputs"]),version["algorithm"],version["factor"],
              version["token"],version["approval"]))
     for key, version in state["heads"].items():
         if version != old["heads"].get(key):
             con.execute("""INSERT INTO published_result VALUES(?,?) ON CONFLICT(resource_key)
-                           DO UPDATE SET version=excluded.version""", (key,version))
+                           DO UPDATE SET result_id=excluded.result_id""", (key,version))
     if state["schedule"] != old["schedule"]:
         con.execute("DELETE FROM schedule")
         if state["schedule"]:

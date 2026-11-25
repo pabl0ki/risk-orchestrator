@@ -382,15 +382,15 @@ def test_engine_uses_relational_route(tmp_path):
         version = engine.publish(jid, job["token"], calculate(job))
         assert not db.get_locks_snapshot()
         engine = Engine(path)
-        engine.decide(jid, "approve", "Риск-менеджер", "review", version=version)
-        engine.decide(jid, "approve", "Директор", "publish", version=version)
+        engine.decide(jid, "approve", "Риск-менеджер", "review")
+        engine.decide(jid, "approve", "Директор", "publish")
         rows = db.conn.execute("""SELECT s.stage_type,r.status,r.external_event FROM stage_request sr
             JOIN stage s USING(stage_id) JOIN run r USING(stage_request_id)
             WHERE sr.bp_request_id=? ORDER BY sr.stage_request_id""", (owner["bp_request_id"],)).fetchall()
         assert [row[0] for row in rows] == ["calculation","approval","sign-off","publication"]
         assert all(row[1] == "done" for row in rows)
         assert [json.loads(row[2])["actor"] for row in rows[1:3]] == ["Риск-менеджер","Директор"]
-        assert db.conn.execute("SELECT version FROM published_result").fetchone()[0] == version
+        assert db.conn.execute("SELECT result_id FROM published_result").fetchone()[0] == version
         assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

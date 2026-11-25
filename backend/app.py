@@ -102,24 +102,20 @@ def create_app(database, duration):
                 snapshot["jobs"][original-1]["rerun_to"] = successor
                 snapshot["jobs"][successor-1]["rerun_from"] = original
         for j in jobs:
+            snapshot_result = j["result"]
             if role(request) in ("reviewer", "director"):
-                version = snapshot["results"][j["result"]]
-                rows = version["rows"]
-                previous = snapshot["results"].get(version.get("previous"))
                 review = next((sig for sig in snapshot["signals"].values()
                                if sig[:3] == [j["id"], "approve", "Риск-менеджер"]), None)
-                j["assessment"] = dict(total=sum(rows), count=len(rows),
-                    previous_id=previous["id"] if previous else None,
-                    previous_total=sum(previous["rows"]) if previous else None,
-                    **engine.approval_checks(snapshot,j,version),
-                    reviewed_by=review[2] if review else None,
+                j["assessment"] = dict(reviewed_by=review[2] if review else None,
                     comment=review[4] if review and len(review)>4 else "")
-                if role(request) == "reviewer":
-                    j["assessment"]["source_rows"] = {k:v["rows"] for k,v in j["inputs"].items()}
-            j.pop("token")
-            j["inputs"] = {k:v["id"] for k,v in j["inputs"].items()}
-            j["version"] = snapshot["results"].get(j["result"], {}).copy()
-            j["version"].pop("token", None)
+                for field in ("inputs", "factor", "resources", "result", "token"):
+                    j.pop(field, None)
+            else:
+                j.pop("token", None)
+                j["inputs"] = {k:v["id"] for k,v in j["inputs"].items()}
+                result = snapshot["results"].get(j["result"], {})
+                j["rows"] = result.get("rows", [])
+            j["approval_status"] = snapshot["results"].get(snapshot_result, {}).get("approval")
             actors = [r["actor"] for r in snapshot["requests"] if r["job"] == j["id"]]
             j["initiators"] = [j["actor"]]
             j["subscribers"] = list(dict.fromkeys(actor for actor in actors if actor != j["actor"]))
@@ -153,9 +149,9 @@ def create_app(database, duration):
     @api.post("/api/jobs/{jid}/decision")
     def decide(jid: int, request: Request, data: dict):
         actor = require(request,"reviewer","director")
-        if not all(isinstance(data.get(k), str) and data[k] for k in ("version","decision","key")):
-            raise ValueError("Нужны решение, версия и ID команды.")
-        return {"successor":engine.decide(jid,data["decision"],actor,data["key"],data.get("comment",""),data["version"])}
+        if not all(isinstance(data.get(k), str) and data[k] for k in ("decision","key")):
+            raise ValueError("Нужны решение и ID команды.")
+        return {"successor":engine.decide(jid,data["decision"],actor,data["key"],data.get("comment",""))}
 
     @api.get("/")
     def index():

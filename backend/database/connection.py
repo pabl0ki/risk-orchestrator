@@ -33,7 +33,30 @@ class OrchestratorDB:
 
         schema_path = Path(__file__).parent / "schema.sql"
         with self.conn:
-            self.conn.executescript("BEGIN IMMEDIATE;\n" + schema_path.read_text(encoding="utf-8"))
+            self.conn.execute("BEGIN IMMEDIATE")
+            old_results = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='result_version'"
+            ).fetchone()
+            if old_results:
+                self.conn.execute("ALTER TABLE result_version RENAME TO run_result")
+                self.conn.execute("ALTER TABLE run_result RENAME COLUMN version TO result_id")
+                self.conn.execute("ALTER TABLE run_result DROP COLUMN previous")
+                self.conn.execute("CREATE UNIQUE INDEX one_result_per_run ON run_result(public_id)")
+                self.conn.execute("ALTER TABLE workflow RENAME COLUMN result_version TO result_id")
+                self.conn.execute("ALTER TABLE published_result RENAME COLUMN version TO result_id")
+                self.conn.execute("ALTER TABLE decision_receipt DROP COLUMN version")
+                self.conn.execute("UPDATE decision_receipt SET signature_length=min(signature_length,5)")
+                self.conn.execute("ALTER TABLE process_route DROP COLUMN revision")
+                self.conn.execute("UPDATE run_result SET approval='approved' WHERE approval='stale'")
+                self.conn.execute("""UPDATE bp_request SET input_payload=json_remove(input_payload,'$.route')
+                    WHERE bp_request_id IN (SELECT bp_request_id FROM request_receipt)""")
+            # executescript commits an open transaction. Keep schema changes and data migration atomic.
+            statement = ""
+            for line in schema_path.read_text(encoding="utf-8").splitlines(keepends=True):
+                statement += line
+                if sqlite3.complete_statement(statement):
+                    self.conn.execute(statement)
+                    statement = ""
             self.conn.execute("DROP INDEX IF EXISTS bp_request_index_0")
             self.conn.execute("DROP INDEX IF EXISTS stage_request_index_1")
             legacy = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger'").fetchone()
@@ -43,8 +66,15 @@ class OrchestratorDB:
                     before = workflow.read_state(self.conn)
                     state = json.loads(row[0])
                     state.setdefault("events", before["events"])
-                    state.setdefault("routes", {code: 1 for code in CATALOG})
+                    state["routes"] = list(state.get("routes", CATALOG))
                     state.setdefault("signals", {})
+                    for job in state["jobs"]:
+                        job.pop("route", None)
+                    for result in state["results"].values():
+                        result.pop("previous", None)
+                        if result.get("approval") == "stale":
+                            result["approval"] = "approved"
+                    state["signals"] = {key: receipt[:5] for key, receipt in state["signals"].items()}
                     workflow.save_changes(self.conn, before, state, CATALOG)
                     if workflow.read_state(self.conn) != state:
                         raise ValueError("Перенос ledger: данные после преобразования не совпадают.")

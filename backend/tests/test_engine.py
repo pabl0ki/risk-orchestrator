@@ -46,7 +46,7 @@ class Orchestration(unittest.TestCase):
         j,=self.e.claim()
         self.finish(j)
         reader,=self.e.claim()
-        self.assertEqual(reader["inputs"]["reference"]["id"],"v1.1")
+        self.assertEqual(reader["inputs"]["reference"]["id"],"RUN-1")
 
     def test_dependency_previous_day_keeps_child_partition(self):
         parent = self.add("Z1", day="2026-11-22")
@@ -77,12 +77,12 @@ class Orchestration(unittest.TestCase):
         reader,=self.e.claim()
         self.assertEqual(reader["inputs"]["deals"]["rows"],calculate(writer))
 
-    def test_T6_version_history(self):
+    def test_distinct_runs_keep_their_results(self):
         self.add(factor=1); self.add(factor=2)
         a,=self.e.claim(); self.finish(a)
         b,=self.e.claim(); self.finish(b)
         versions=self.e.snapshot()["results"]
-        self.assertEqual(versions["v2.1"]["rows"],[v*2 for v in versions["v1.1"]["rows"]])
+        self.assertEqual(versions["RUN-2"]["rows"],[v*2 for v in versions["RUN-1"]["rows"]])
 
     def test_T7_no_hold_and_wait(self):
         self.add("Z1"); self.add("Z2")
@@ -98,7 +98,7 @@ class Orchestration(unittest.TestCase):
         self.e=Engine(self.db)
         fresh,=self.e.claim()
         self.assertIsNone(self.finish(old))
-        self.assertEqual(self.finish(fresh),"v1.2")
+        self.assertEqual(self.finish(fresh),"RUN-1")
 
     def test_T9_retry_publish(self):
         self.add(); old,=self.e.claim()
@@ -123,7 +123,7 @@ class Orchestration(unittest.TestCase):
         self.add(); job,=self.e.claim(); self.finish(job)
         s=self.e.snapshot()
         self.assertEqual([e["seq"] for e in s["events"]],[1,2,3])
-        self.assertEqual(s["results"]["v1.1"]["inputs"]["deals"],"base/deals/"+DAY)
+        self.assertEqual(s["results"]["RUN-1"]["inputs"]["deals"],"base/deals/"+DAY)
 
     def test_T16_wakeup(self):
         self.add("Z1"); self.add("P1"); j,=self.e.claim()
@@ -135,7 +135,7 @@ class Orchestration(unittest.TestCase):
         a,=self.e.claim();self.e.control(a["id"],"fault")
         b,=self.e.claim();self.finish(b)
         child,=self.e.claim()
-        self.assertEqual(child["inputs"]["deals"]["id"],"v1.2")
+        self.assertEqual(child["inputs"]["deals"]["id"],"RUN-1")
         self.finish(child)
         parent=self.add("Z1",rerun=True); child_id=self.add(parent=parent)
         for _ in range(2):
@@ -151,7 +151,7 @@ class Orchestration(unittest.TestCase):
         self.e.control(job["id"],"cancel")
         self.assertIsNone(self.finish(job))
 
-    def test_T10_invalidate_approval(self):
+    def test_published_run_keeps_its_approval(self):
         jid = self.add(approval=True)
         job, = self.e.claim()
         self.finish(job)
@@ -160,7 +160,7 @@ class Orchestration(unittest.TestCase):
         self.add("Z1")
         writer, = self.e.claim()
         self.finish(writer)
-        self.assertEqual(self.e.snapshot()["results"]["v1.1"]["approval"], "stale")
+        self.assertEqual(self.e.snapshot()["results"]["RUN-1"]["approval"], "approved")
 
     def test_T12_repeat_and_selfapproval(self):
         jid = self.add(approval=True)
@@ -192,33 +192,20 @@ class Orchestration(unittest.TestCase):
         jid = self.add("FX", approval=True)
         candidate, = self.e.claim()
         new = self.finish(candidate)
-        self.e.decide(jid, "approve", "Риск-менеджер", "review", version=new)
+        self.e.decide(jid, "approve", "Риск-менеджер", "review")
         self.assertEqual(self.e.snapshot()["heads"], {"reference/*": old})
-        self.e.decide(jid, "approve", "Директор", "sign", version=new)
+        self.e.decide(jid, "approve", "Директор", "sign")
         self.assertEqual(self.e.snapshot()["heads"], {"reference/*": new})
         self.add(day="2027-01-01")
         consumer, = self.e.claim()
         self.assertEqual(consumer["inputs"]["reference"]["id"], new)
 
-    def test_row_mismatch_blocks_each_decision(self):
+    def test_invalid_calculation_rejected_before_review(self):
         jid = self.add(approval=True)
         job, = self.e.claim()
-        rid = self.finish(job)
-        for actor in ("Риск-менеджер", "Директор"):
-            with self.subTest(actor=actor):
-                with self.e.tx() as state:
-                    state["results"][rid]["rows"][0] += 1
-                state = self.e.snapshot()
-                checks = self.e.approval_checks(state, state["jobs"][jid-1], state["results"][rid])
-                self.assertTrue(checks["current"])
-                self.assertFalse(checks["verified"])
-                with self.assertRaisesRegex(ValueError, "Построчная сверка") as error:
-                    self.e.decide(jid, "approve", actor, actor, version=rid)
-                self.assertEqual(str(error.exception), checks["block_reason"])
-                self.assertFalse(self.e.snapshot()["heads"])
-                with self.e.tx() as state:
-                    state["results"][rid]["rows"][0] -= 1
-                self.e.decide(jid, "approve", actor, actor, version=rid)
+        with self.assertRaisesRegex(ValueError, "некорректный результат"):
+            self.e.publish(jid, job["token"], [])
+        self.assertFalse(self.e.snapshot()["results"])
 
     def test_two_stage_publication(self):
         jid = self.add(approval=True)
@@ -226,10 +213,10 @@ class Orchestration(unittest.TestCase):
         version = self.finish(job)
         self.assertFalse(self.e.snapshot()["heads"])
         with self.assertRaises(ValueError):
-            self.e.decide(jid,"approve","Директор","early",version=version)
-        self.e.decide(jid,"approve","Риск-менеджер","review",version=version)
+            self.e.decide(jid,"approve","Директор","early")
+        self.e.decide(jid,"approve","Риск-менеджер","review")
         self.assertFalse(self.e.snapshot()["heads"])
-        self.e.decide(jid,"approve","Директор","sign",version=version)
+        self.e.decide(jid,"approve","Директор","sign")
         self.assertEqual(list(self.e.snapshot()["heads"].values()),[version])
 
     def test_superseded_candidate(self):
@@ -243,17 +230,8 @@ class Orchestration(unittest.TestCase):
         self.add("FX")
         writer, = self.e.claim()
         ref = self.finish(writer)
-        with self.assertRaises(ValueError) as error:
-            self.e.decide(jid,"approve","Директор","late")
-        self.assertIn(f"«Справочник»: в расчёте — base/reference/*, сейчас — {ref}", str(error.exception))
-        self.assertIn(f"«Кредитный результат»: при расчёте — ещё не опубликовано, сейчас — {published}", str(error.exception))
-        self.assertEqual(self.e.snapshot()["heads"]["credit/"+DAY],published)
-
-    def test_T15_route_revision(self):
-        self.add()
-        self.e.revise("P1")
-        self.add()
-        self.assertEqual([j["route"] for j in self.e.snapshot()["jobs"]],[1,2])
+        self.e.decide(jid,"approve","Директор","late")
+        self.assertEqual(self.e.snapshot()["heads"]["credit/"+DAY], f"RUN-{jid}")
 
 
 if __name__=="__main__":

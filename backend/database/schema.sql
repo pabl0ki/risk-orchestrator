@@ -141,13 +141,12 @@ CREATE INDEX IF NOT EXISTS event_index_4 ON event (event_type, timestamp);
 -- route и required_resources в stage: JSON для MVP, отдельные таблицы — задел на будущее
 -- Public RUN numbers remain stable across all stages of a business request.
 CREATE TABLE IF NOT EXISTS process_route (
-  code TEXT PRIMARY KEY, business_process_id INTEGER NOT NULL UNIQUE REFERENCES business_process,
-  revision INTEGER NOT NULL
+  code TEXT PRIMARY KEY, business_process_id INTEGER NOT NULL UNIQUE REFERENCES business_process
 );
 CREATE TABLE IF NOT EXISTS workflow (
   public_id INTEGER PRIMARY KEY, bp_request_id INTEGER NOT NULL UNIQUE REFERENCES bp_request,
   attempt INTEGER NOT NULL, token TEXT, lease REAL NOT NULL, inputs TEXT NOT NULL,
-  result_version TEXT REFERENCES result_version(version) DEFERRABLE INITIALLY DEFERRED,
+  result_id TEXT REFERENCES run_result(result_id) DEFERRABLE INITIALLY DEFERRED,
   reason TEXT NOT NULL, start_at REAL, end_at REAL, calculated_at REAL,
   wait_for INTEGER REFERENCES workflow, has_wait_for INTEGER NOT NULL
 );
@@ -155,19 +154,19 @@ CREATE TABLE IF NOT EXISTS request_receipt (
   request_key TEXT PRIMARY KEY, bp_request_id INTEGER NOT NULL UNIQUE REFERENCES bp_request,
   public_id INTEGER NOT NULL REFERENCES workflow
 );
-CREATE TABLE IF NOT EXISTS result_version (
-  version TEXT PRIMARY KEY, public_id INTEGER NOT NULL REFERENCES workflow,
-  resource TEXT NOT NULL, scope TEXT, previous TEXT REFERENCES result_version,
+CREATE TABLE IF NOT EXISTS run_result (
+  result_id TEXT PRIMARY KEY, public_id INTEGER NOT NULL UNIQUE REFERENCES workflow,
+  resource TEXT NOT NULL, scope TEXT,
   rows_json TEXT NOT NULL, inputs TEXT NOT NULL, algorithm TEXT NOT NULL, factor INTEGER NOT NULL,
   token TEXT, approval TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS published_result (
-  resource_key TEXT PRIMARY KEY, version TEXT NOT NULL REFERENCES result_version
+  resource_key TEXT PRIMARY KEY, result_id TEXT NOT NULL REFERENCES run_result(result_id)
 );
 CREATE TABLE IF NOT EXISTS decision_receipt (
   command_key TEXT PRIMARY KEY, public_id INTEGER NOT NULL REFERENCES workflow,
   decision TEXT NOT NULL, actor TEXT NOT NULL, successor INTEGER REFERENCES workflow,
-  comment TEXT, version TEXT, signature_length INTEGER NOT NULL
+  comment TEXT, signature_length INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS schedule (
   id INTEGER PRIMARY KEY CHECK(id=1), process_code TEXT NOT NULL REFERENCES process_route,
