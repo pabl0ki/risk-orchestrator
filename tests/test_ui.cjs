@@ -61,6 +61,12 @@ async function main() {
       ["running", "running", "queued"],
     );
     assert.deepEqual(live.jobs[0].initiators, ["Анна", "Регламент"]);
+    await page.click('[data-tab="queue"]');
+    await page.getByRole("button",{name:"Сделки · ожидает №1"}).click();
+    assert.match(await page.locator("#jobTitle").textContent(), /^RUN-1 ·/);
+    const resourceRow = page.locator("#jobBody tr").filter({hasText:"Сделки"});
+    assert.match(await resourceRow.first().textContent(), /2026-11-22.*Чтение/);
+    await page.locator("#details [data-close]").click();
     await page.screenshot({
       path: path.join(screenshots, "01 — Ожидание ресурса.png"),
     });
@@ -164,6 +170,40 @@ async function main() {
     }
     await page.selectOption("#batch","1");
     await page.getByRole("heading",{name:"Чтение и запись"}).waitFor();
+    await page.selectOption("#scenario","reapproval");
+    const launched = page.waitForResponse(r=>r.url().includes("/api/demo?scenario=reapproval"));
+    await page.click("#demo");
+    const reviewBatch = await (await launched).json();
+    const [original, reference] = reviewBatch.jobs;
+    await page.selectOption("#role","reviewer");
+    await page.locator(`[data-job="${original}"]`).first().click();
+    await page.getByText(new RegExp("Изменился вход «Справочник».*v"+reference+"\\.1")).waitFor();
+    assert(await page.locator('[data-decision="approve"]').isDisabled());
+    await page.fill("#comment","Нужна повторная проверка");
+    const decision = page.waitForResponse(r=>r.url().endsWith("/decision"));
+    await page.click('[data-decision="reject"]');
+    const {successor} = await (await decision).json();
+    await page.getByText(`RUN-${original} возвращён на перерасчёт. Создан RUN-${successor}.`).waitFor();
+    await page.locator(`[data-job="${successor}"]`).first().click();
+    await page.click('[data-decision="approve"]');
+    await page.waitForFunction(()=>!document.querySelector("#details").open);
+    await page.selectOption("#role","director");
+    await page.locator(`[data-job="${successor}"]`).first().click();
+    await page.click('[data-decision="approve"]');
+    await page.waitForFunction(()=>!document.querySelector("#details").open);
+    await page.selectOption("#role","admin");
+    await page.locator(`[data-job="${original}"]`).first().click();
+    await page.locator(`#jobBody [data-job="${successor}"]`).click();
+    await page.locator(`#jobBody [data-job="${original}"]`).click();
+    assert((await page.locator("#jobTitle").textContent()).startsWith("RUN-"+original+" ·"));
+    const state = await snapshot();
+    const batch = state.batches.find(b=>b.id===reviewBatch.id);
+    assert.deepEqual(batch.jobs,[original,reference,successor]);
+    const published = state.jobs.find(j=>j.id===successor);
+    assert.equal(published.version.approval,"approved");
+    assert.equal(published.inputs.reference,state.jobs.find(j=>j.id===reference).result);
+    scenarios.push({scenario:"reapproval",requests:batch.requests,runs:batch.jobs.length,
+      events:state.events.filter(e=>batch.jobs.includes(e.job))});
     assert.deepEqual(errors, []);
     fs.writeFileSync(path.join(reports,"Сценарии.json"),JSON.stringify(scenarios,null,2));
   } finally {

@@ -14,10 +14,9 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
-from .engine import CATALOG, LABELS, Engine
-from .calculations import calculate
-from .scenarios import SCENARIOS, launch_batch
-from .worker import run_worker
+from backend.orchestrator.engine import CATALOG, LABELS, Engine
+from backend.orchestrator.scenarios import SCENARIOS, launch_batch
+from backend.orchestrator.worker import run_worker
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
@@ -50,6 +49,7 @@ def create_app(database, duration):
         stop = ctx.Event()
         worker = ctx.Process(target=run_worker, args=(database, duration, stop), daemon=True)
         worker.start()
+        app.state.worker = worker
         try:
             yield
         finally:
@@ -96,6 +96,11 @@ def create_app(database, duration):
             stage = "pending" if role(request) == "reviewer" else "reviewed"
             jobs = [j for j in jobs if j["status"] == "review" and snapshot["results"][j["result"]]["approval"] == stage]
         ids = {j["id"] for j in jobs}
+        # Decision receipts also preserve links for reruns created by older versions.
+        for original, decision, _, successor, *_ in snapshot["signals"].values():
+            if decision == "reject" and successor:
+                snapshot["jobs"][original-1]["rerun_to"] = successor
+                snapshot["jobs"][successor-1]["rerun_from"] = original
         for j in jobs:
             if role(request) in ("reviewer", "director"):
                 version = snapshot["results"][j["result"]]
@@ -106,9 +111,7 @@ def create_app(database, duration):
                 j["assessment"] = dict(total=sum(rows), count=len(rows),
                     previous_id=previous["id"] if previous else None,
                     previous_total=sum(previous["rows"]) if previous else None,
-                    verified=calculate(j) == rows,
-                    current=engine.fresh(snapshot,j,version) and
-                            snapshot["heads"].get(version["object"]+"/"+j["day"]) == version.get("previous"),
+                    **engine.approval_checks(snapshot,j,version),
                     reviewed_by=review[2] if review else None,
                     comment=review[4] if review and len(review)>4 else "")
                 if role(request) == "reviewer":
@@ -118,7 +121,8 @@ def create_app(database, duration):
             j["version"] = snapshot["results"].get(j["result"], {}).copy()
             j["version"].pop("token", None)
             j["initiators"] = [r["actor"] for r in snapshot["requests"] if r["job"] == j["id"]]
-        return dict(jobs=jobs, role=role(request), catalog={k:v[0] for k,v in CATALOG.items()},
+        return dict(jobs=jobs, role=role(request), worker_alive=request.app.state.worker.is_alive(),
+                    catalog={k:v[0] for k,v in CATALOG.items()},
                     scenarios=SCENARIOS if role(request)=="admin" else {},
                     batches=snapshot.get("demo_batches", []) if role(request)=="admin" else [],
                     labels=LABELS, events=[e for e in snapshot["events"] if e["job"] in ids or role(request)=="admin"])

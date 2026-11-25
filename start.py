@@ -1,5 +1,6 @@
 """Запускает стенд с зависимостями, установленными в папку проекта."""
 import os
+import importlib
 import runpy
 import subprocess
 import sys
@@ -17,4 +18,5 @@ if __name__ == "__main__":
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", "--target", str(libraries),
                         "-r", str(ROOT / "requirements.txt")], check=True)
+        importlib.invalidate_caches()
     runpy.run_module("backend.app", run_name="__main__", alter_sys=True)

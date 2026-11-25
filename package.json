@@ -1,0 +1,12 @@
+{
+  "name": "risk-orchestrator-ui-tests",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test:ui": "node tests/test_ui.cjs",
+    "browser:install": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
