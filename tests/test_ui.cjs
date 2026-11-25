@@ -53,6 +53,11 @@ async function main() {
     await page.goto(url);
     await page.locator('#connection[data-status="online"]').waitFor();
     const snapshot = async () => await (await fetch(url + "/api/state")).json();
+    const invalidRun = await page.request.post(url + "/api/run", {
+      data: { kind: [], day: "2026-11-22" },
+    });
+    assert.equal(invalidRun.status(), 400);
+    assert.equal((await invalidRun.json()).detail, "Выберите процесс и бизнес-дату.");
     await page.click("#demo");
     await page.getByText("Сделки · ожидает №1").first().waitFor();
     const live = await snapshot();

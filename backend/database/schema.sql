@@ -2,7 +2,7 @@ PRAGMA foreign_keys = ON;
 
 -- Шаблон бизнес-процесса
 -- route: JSON для MVP (упорядоченный список stage_id с правилами перехода)
-CREATE TABLE business_process (
+CREATE TABLE IF NOT EXISTS business_process (
   business_process_id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   risk_type TEXT,
@@ -16,7 +16,7 @@ CREATE TABLE business_process (
 -- required_resources: JSON для MVP, список {resource_id, mode, granularity}
 -- depends_on_stages: JSON, список stage_id предшественников
 -- avg_duration: секунды
-CREATE TABLE stage (
+CREATE TABLE IF NOT EXISTS stage (
   stage_id INTEGER PRIMARY KEY AUTOINCREMENT,
   business_process_id INTEGER NOT NULL,
   name TEXT NOT NULL,
@@ -32,7 +32,7 @@ CREATE TABLE stage (
 -- initiator_type: manual / schedule; initiator_id: user_id или schedule_id
 -- input_hash: ключ дубликатов SHA256(business_process_id + date + norm(input_payload))
 -- status: pending / expanded / in_progress / done / failed / merged / rejected
-CREATE TABLE bp_request (
+CREATE TABLE IF NOT EXISTS bp_request (
   bp_request_id INTEGER PRIMARY KEY AUTOINCREMENT,
   business_process_id INTEGER NOT NULL,
   date DATE NOT NULL,
@@ -52,7 +52,7 @@ CREATE TABLE bp_request (
 -- input_hash: ключ дубликатов SHA256(stage_id + date + norm(input_payload)); режим доступа и ресурсы НЕ входят в хэш
 -- status: created / waiting_dependency / queued / approved / merged / rejected
 -- waiting_for: JSON {type: resource|dependency, id: ...}
-CREATE TABLE stage_request (
+CREATE TABLE IF NOT EXISTS stage_request (
   stage_request_id INTEGER PRIMARY KEY AUTOINCREMENT,
   bp_request_id INTEGER NOT NULL,
   stage_id INTEGER NOT NULL,
@@ -74,7 +74,7 @@ CREATE TABLE stage_request (
 -- stage_request_id UNIQUE: один запуск на заявку
 -- status: queued / waiting_dependency / waiting_resource / running / waiting_external / done / failed / cancelled
 -- parent_run_id: если схлопнут с дубликатом
-CREATE TABLE run (
+CREATE TABLE IF NOT EXISTS run (
   run_id INTEGER PRIMARY KEY AUTOINCREMENT,
   stage_request_id INTEGER NOT NULL UNIQUE,
   status TEXT NOT NULL,
@@ -95,7 +95,7 @@ CREATE TABLE run (
 -- data_key: идентификатор партиции; для блокировки всей таблицы всегда 'ALL' (NULL не использовать)
 -- mode: read / write / exclusive; state: held / released / expired
 -- expires_at: таймаут удержания, по умолчанию 30 минут
-CREATE TABLE lock (
+CREATE TABLE IF NOT EXISTS lock (
   lock_id INTEGER PRIMARY KEY AUTOINCREMENT,
   resource_id TEXT NOT NULL,
   granularity TEXT NOT NULL,
@@ -111,7 +111,7 @@ CREATE TABLE lock (
 
 -- Журнал событий
 -- entity_id: полиморфная ссылка (entity_type + entity_id), FK не задаётся
-CREATE TABLE event (
+CREATE TABLE IF NOT EXISTS event (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
   timestamp DATETIME NOT NULL,
   event_type TEXT NOT NULL,
@@ -121,12 +121,12 @@ CREATE TABLE event (
   actor TEXT
 );
 
-CREATE UNIQUE INDEX bp_request_index_0 ON bp_request (business_process_id, date, input_hash);
-CREATE UNIQUE INDEX stage_request_index_1 ON stage_request (stage_id, date, input_hash);
-CREATE INDEX lock_index_2 ON lock (resource_id, granularity, data_key, state);
-CREATE UNIQUE INDEX lock_unique_idx ON lock (run_id, resource_id, granularity, data_key);
-CREATE INDEX event_index_3 ON event (entity_type, entity_id, timestamp);
-CREATE INDEX event_index_4 ON event (event_type, timestamp);
+CREATE UNIQUE INDEX IF NOT EXISTS bp_request_index_0 ON bp_request (business_process_id, date, input_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS stage_request_index_1 ON stage_request (stage_id, date, input_hash);
+CREATE INDEX IF NOT EXISTS lock_index_2 ON lock (resource_id, granularity, data_key, state);
+CREATE UNIQUE INDEX IF NOT EXISTS lock_unique_idx ON lock (run_id, resource_id, granularity, data_key);
+CREATE INDEX IF NOT EXISTS event_index_3 ON event (entity_type, entity_id, timestamp);
+CREATE INDEX IF NOT EXISTS event_index_4 ON event (event_type, timestamp);
 
 -- Комментарии к схеме:
 -- business_process: шаблон бизнес-процесса
@@ -139,3 +139,4 @@ CREATE INDEX event_index_4 ON event (event_type, timestamp);
 -- input_hash в bp_request: ключ дубликатов SHA256(business_process_id + date + norm(input_payload))
 -- input_hash в stage_request: ключ дубликатов SHA256(stage_id + date + norm(input_payload))
 -- route и required_resources в stage: JSON для MVP, отдельные таблицы — задел на будущее
+CREATE TABLE IF NOT EXISTS ledger (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);

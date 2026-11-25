@@ -340,3 +340,24 @@ def test_get_bp_request_full(db):
     assert full[0]["bp_request_id"] == bp_req["id"]
     assert full[0]["stage_request_id"] == sr
     assert full[0]["run_id"] == run_id
+
+def test_engine_migrates_legacy_events_once(tmp_path):
+    from contextlib import closing
+    import sqlite3
+    from backend.orchestrator.engine import Engine
+
+    path = tmp_path / "old.sqlite"
+    entry = {"seq": 1, "at": 1234567890, "job": 0, "message": "Старое событие"}
+    state = dict(jobs=[], requests=[], results={}, heads={}, events=[entry], schedule=None)
+    with closing(sqlite3.connect(path)) as con, con:
+        con.execute("CREATE TABLE ledger (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+        con.execute("INSERT INTO ledger VALUES (1, ?)", (json.dumps(state),))
+
+    engine = Engine(path)
+    engine.submit(dict(kind="P1", day="2026-11-22", actor="Анна"))
+    events = Engine(path).snapshot()["events"]
+    assert events[0] == entry
+    assert [event["seq"] for event in events] == [1, 2]
+    with closing(OrchestratorDB(path)) as db:
+        assert [json.loads(row["payload"]) for row in reversed(db.get_recent_events())] == events
+        assert "events" not in json.loads(db.conn.execute("SELECT payload FROM ledger").fetchone()[0])
