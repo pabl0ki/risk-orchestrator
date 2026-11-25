@@ -135,9 +135,10 @@ def create_app(database, duration):
     @api.post("/api/run")
     def launch(request: Request, data: dict):
         actor = require(request, "admin","analyst")
-        if not isinstance(data.get("day"), str) or data.get("kind") not in CATALOG:
+        kind = data.get("kind")
+        if not isinstance(kind, str) or kind not in CATALOG or not isinstance(data.get("day"), str):
             raise ValueError("Выберите процесс и бизнес-дату.")
-        return {"id":engine.submit(dict(kind=data["kind"],day=data["day"], actor=actor,
+        return {"id":engine.submit(dict(kind=kind,day=data["day"], actor=actor,
                                         parent=data.get("parent"), approval=True, key=data.get("key")))}
 
     @api.post("/api/jobs/{jid}/cancel")

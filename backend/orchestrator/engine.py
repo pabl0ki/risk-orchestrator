@@ -1,13 +1,13 @@
 """Одноузловой демонстрационный оркестратор. Только стандартная библиотека."""
 import hashlib
-import json
-import sqlite3
 import time
 import uuid
 from concurrent.futures import Future
 from contextlib import closing, contextmanager
 from datetime import date
 from threading import Lock
+
+from backend.database.connection import OrchestratorDB
 
 CATALOG = {
     "P1": ("Кредитный риск", [("deals", "R"), ("rates", "R"), ("credit", "W")]),
@@ -79,7 +79,7 @@ class Engine:
         self.db = str(db)
         self.inbox_lock = Lock()
         self.inbox = []
-        with self.tx() as s:
+        with closing(OrchestratorDB(self.db)) as store, store.state_transaction() as s:
             if not s:
                 s.update(jobs=[], requests=[], results={}, heads={}, events=[], schedule=None)
             s.setdefault("routes", {k: 1 for k in CATALOG})
@@ -87,23 +87,12 @@ class Engine:
 
     @contextmanager
     def tx(self):
-        con = sqlite3.connect(self.db, timeout=20)
-        try:
-            con.execute("BEGIN IMMEDIATE")
-            con.execute("CREATE TABLE IF NOT EXISTS ledger (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
-            row = con.execute("SELECT payload FROM ledger WHERE id=1").fetchone()
-            state = json.loads(row[0]) if row else {}
+        with closing(OrchestratorDB(self.db, initialize=False)) as store, store.state_transaction() as state:
             yield state
-            payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
-            if not row or row[0] != payload:
-                con.execute("INSERT OR REPLACE INTO ledger VALUES (1,?)", (payload,))
-            con.commit()
-        finally:
-            con.close()
 
     def snapshot(self):
-        with closing(sqlite3.connect(self.db)) as con:
-            return json.loads(con.execute("SELECT payload FROM ledger WHERE id=1").fetchone()[0])
+        with closing(OrchestratorDB(self.db, initialize=False)) as store:
+            return store.snapshot()
 
     def add(self, s, data):
         kind, day = data["kind"], date.fromisoformat(data["day"]).isoformat()

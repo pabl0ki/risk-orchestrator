@@ -1,6 +1,7 @@
 """Слой подключения к БД и бизнес-методы доступа к данным."""
 import sqlite3
 import json
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -11,21 +12,61 @@ from backend.database import queries
 class OrchestratorDB:
     """Единая точка доступа к SQLite-базе оркестратора."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, initialize=True):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, isolation_level=None)
+        self.conn = sqlite3.connect(db_path, isolation_level=None, timeout=20)
         self.conn.row_factory = sqlite3.Row
-        self._init_db()
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        if initialize:
+            try:
+                self._init_db()
+            except Exception:
+                self.close()
+                raise
 
     # --- Инициализация ---
 
     def _init_db(self):
         self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA foreign_keys=ON;")
-        self.conn.execute("PRAGMA busy_timeout=5000;")
 
         schema_path = Path(__file__).parent / "schema.sql"
-        self.conn.executescript(schema_path.read_text())
+        self.conn.executescript(schema_path.read_text(encoding="utf-8"))
+
+    def _read_state(self):
+        row = self.conn.execute("SELECT payload FROM ledger WHERE id=1").fetchone()
+        state = json.loads(row[0]) if row else {}
+        legacy_journal = "events" in state
+        if state and not legacy_journal:
+            events = self.conn.execute(
+                "SELECT payload FROM event WHERE event_type='orchestrator.operation' ORDER BY event_id"
+            )
+            state["events"] = [json.loads(item[0]) for item in events]
+        return state, row[0] if row else None, legacy_journal
+
+    def snapshot(self):
+        self.conn.execute("BEGIN")
+        with self.conn:
+            state, _, _ = self._read_state()
+            return state
+
+    @contextmanager
+    def state_transaction(self):
+        self.conn.execute("BEGIN IMMEDIATE")
+        with self.conn:
+            state, original, legacy = self._read_state()
+            # Old ledger files keep their journal inside the state until the first commit.
+            existing = 0 if legacy else len(state.get("events", []))
+            yield state
+            events = state.get("events", [])
+            for entry in events[existing:]:
+                self.conn.execute(queries.INSERT_EVENT, (
+                    datetime.fromtimestamp(entry["at"]).isoformat(), "orchestrator.operation",
+                    "run", entry["job"], json.dumps(entry, ensure_ascii=False), "system",
+                ))
+            payload = json.dumps({k: v for k, v in state.items() if k != "events"},
+                                 ensure_ascii=False, separators=(",", ":"))
+            if payload != original:
+                self.conn.execute("INSERT OR REPLACE INTO ledger (id,payload) VALUES (1,?)", (payload,))
 
     # --- Справочники ---
 
