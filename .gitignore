@@ -13,7 +13,6 @@ eggs/
 parts/
 var/
 sdist/
-develop-eggs/
 .installed.cfg
 *.egg-info
 *.egg
@@ -21,7 +20,6 @@ develop-eggs/
 # Virtual environments
 venv/
 ENV/
-env/
 .venv/
 
 # Testing
@@ -43,9 +41,11 @@ Thumbs.db
 
 # Runtime dependencies
 .runtime/
+node_modules/
 
 # Local database
-data/*.sqlite3
+/data/*.sqlite3
+/stage4.sqlite3
 
 # Environment
 .env

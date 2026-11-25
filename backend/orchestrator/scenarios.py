@@ -6,6 +6,7 @@ SCENARIOS = {
     "pipeline": ("Закрытие трёх дат", "Для каждой даты последовательно загружаются сделки и курсы. После загрузки курсов кредитный и рыночный расчёты могут идти параллельно."),
     "capacity": ("Пиковая нагрузка", "Для шести дат одновременно поступают кредитные и рыночные расчёты. Доступны четыре слота. Повторные обращения не занимают дополнительных слотов."),
     "reference": ("Общий справочник", "Четыре расчёта читают справочник для двух дат. Обновление справочника ждёт завершения чтения. Ещё четыре расчёта зависят от публикации новой версии."),
+    "reapproval": ("Устаревшая версия и перерасчёт", "Кредитный расчёт Анны использует исходную для этой партии версию справочника. Дождитесь завершения обновления справочника, верните расчёт от имени риск-менеджера, согласуйте новый RUN и утвердите его от имени директора."),
 }
 
 
@@ -17,9 +18,9 @@ def launch_batch(engine, scenario):
         first = max([date(2026, 11, 21), *used]) + timedelta(days=1)
         ids = []
 
-        def add(kind, offset, actor, *, parent=0, channel="manual"):
+        def add(kind, offset, actor, *, parent=0, channel="manual", approval=False):
             jid = engine.add(state, dict(kind=kind, day=(first + timedelta(days=offset)).isoformat(),
-                                         actor=actor, parent=parent, channel=channel))
+                                         actor=actor, parent=parent, channel=channel, approval=approval))
             ids.append(jid)
             return jid
 
@@ -39,6 +40,9 @@ def launch_batch(engine, scenario):
                 add("P1", offset, "Анна")
                 add("P1", offset, "Регламент", channel="schedule")
                 add("P2", offset, "Илья")
+        elif scenario == "reapproval":
+            add("P1", 0, "Анна", approval=True)
+            add("FX", 0, "Владелец справочника")
         else:
             for offset in range(2):
                 add("P1", offset, "Анна")
