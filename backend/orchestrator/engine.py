@@ -6,6 +6,7 @@ from contextlib import closing, contextmanager
 from datetime import date
 
 from backend.database.connection import OrchestratorDB
+from backend.database.utils import calculate_hash
 from .expand import Expand
 from .admit import Admit
 from .release import Release
@@ -26,7 +27,7 @@ LABELS = dict(
     market="Рыночный результат", reference="Справочник", work="Общая рабочая таблица"
 )
 
-LEASE_SECONDS = 60
+LEASE_SECONDS = 30
 HEARTBEAT_INTERVAL = 10
 STALE_THRESHOLD = 30
 SLOTS = 4
@@ -99,6 +100,17 @@ class Engine:
         if params["rerun"]:
             params["rerun_key"] = key
         bp = db.get_business_process_by_name(CATALOG[kind][0])
+        input_hash = calculate_hash(bp["business_process_id"], day, params)
+        existing = db.conn.execute(
+            "SELECT bp_request_id FROM bp_request WHERE business_process_id=? AND date=? AND input_hash=? "
+            "AND status NOT IN ('done','failed','rejected','cancelled','merged')",
+            (bp["business_process_id"], day, input_hash),
+        ).fetchone()
+        if existing:
+            jid = existing["bp_request_id"]
+            db.log_event("request_received","bp_request",jid,dict(job=jid,key=key,signature=signature,channel=channel,
+                message="Присоединено обращение (дубликат)"+" · "+actor),actor)
+            return jid
         receipt = db.create_bp_request(bp["business_process_id"],day,channel,actor,params)
         jid = receipt["id"]
         if not receipt["merged"]:
@@ -146,7 +158,7 @@ class Engine:
                 Release(db).release_run(int(token),"done")
                 for sr in db.get_stage_requests_by_bp_request(jid):
                     if sr["status"] == "queued" and db.get_stage(sr["stage_id"])["stage_type"] in ("approval","sign-off"):
-                        Admit(db).one(sr["stage_request_id"])
+                        Admit(db).admit_stage_request(sr["stage_request_id"])
                 return jid
             done = db.conn.execute("""SELECT 1 FROM run JOIN stage_request USING(stage_request_id)
                 WHERE run_id=? AND bp_request_id=? AND run.status='done'""",(token,jid)).fetchone()

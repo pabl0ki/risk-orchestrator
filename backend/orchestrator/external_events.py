@@ -37,7 +37,7 @@ def receive_signal(db, run_id, actor, decision, event_id, comment, rerun):
             for sr in db.get_stage_requests_by_bp_request(jid):
                 stage = db.get_stage(sr["stage_id"])
                 if stage["stage_type"] in ROLES and sr["status"] == "queued":
-                    Admit(db).one(sr["stage_request_id"])
+                    Admit(db).admit_stage_request(sr["stage_request_id"])
         command.update(job=jid, successor=rerun(jid) if decision=="reject" else None,
                        message=actor+(" · согласовано" if decision=="approve" else " · отклонено"))
         db.log_event("external_signal","run",run_id,command,actor)

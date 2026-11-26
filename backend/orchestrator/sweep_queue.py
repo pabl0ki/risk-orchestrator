@@ -17,7 +17,7 @@ def sweep_queue(db, maintenance=True):
         admit = Admit(db)
         started = []
         for request in db.get_all_queued_requests():
-            result = admit.one(request["stage_request_id"])
+            result = admit.admit_stage_request(request["stage_request_id"])
             if result["decision"] == "running":
                 started.append(result)
         return started

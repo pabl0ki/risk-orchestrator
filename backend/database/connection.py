@@ -259,7 +259,7 @@ class OrchestratorDB:
             pass
         try:
             with self.transaction():
-                for lock in locks:
+                for lock in sorted(locks, key=lambda l: (l["resource_id"], l["granularity"], l["data_key"])):
                     args = (lock["resource_id"], lock["data_key"], lock["mode"])
                     if self.conn.execute(queries.CHECK_LOCK_CONFLICT, args).fetchone():
                         raise Conflict

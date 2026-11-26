@@ -159,7 +159,7 @@ CHECK_LOCK_CONFLICT = """
 INSERT_LOCK = """
     INSERT INTO lock 
     (resource_id, granularity, data_key, run_id, mode, acquired_at, expires_at, state)
-    VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+30 minutes'), 'held')
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+30 seconds'), 'held')
 """
 
 UPDATE_LOCK_STATE = """

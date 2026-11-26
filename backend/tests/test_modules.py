@@ -37,10 +37,10 @@ def test_failed_lock_acquisition_rolls_back_run(engine, monkeypatch):
                 return False
             patch.setattr(db, "acquire_locks", interrupted)
             with pytest.raises(RuntimeError):
-                Admit(db).one(sid)
+                Admit(db).admit_stage_request(sid)
         assert db.conn.execute("SELECT count(*) FROM run").fetchone()[0] == 0
         assert db.conn.execute("SELECT count(*) FROM lock").fetchone()[0] == 0
-        assert Admit(db).one(sid)["decision"] == "running"
+        assert Admit(db).admit_stage_request(sid)["decision"] == "running"
 
 
 def test_stale_run_released_once(engine):

@@ -32,7 +32,7 @@ class Admit:
             self.db.log_event(status,"bp_request",sr["bp_request_id"],info)
         return {"decision":status}
 
-    def one(self, sr_id):
+    def admit_stage_request(self, sr_id):
         db = self.db
         with db.transaction():
             sr = db.conn.execute("SELECT * FROM stage_request WHERE stage_request_id=?", (sr_id,)).fetchone()
@@ -52,7 +52,7 @@ class Admit:
                     db.conn.execute("UPDATE stage_request SET status='rejected',rejection_reason='parent_failed' WHERE stage_request_id=?", (sr_id,))
                     db.conn.execute("UPDATE bp_request SET status='rejected' WHERE bp_request_id=?", (sr["bp_request_id"],))
                     return {"decision":"rejected"}
-                return self.wait(sr,"waiting_dependency",f"Ожидание предшественника №{parent[0]}",parent[0])
+                return self.wait(sr,"waiting_dependency",f"Ожидание зависимости №{parent[0]}",parent[0])
             stage = db.get_stage(sr["stage_id"])
             params = json.loads(db.conn.execute("SELECT input_payload FROM bp_request WHERE bp_request_id=?", (sr["bp_request_id"],)).fetchone()[0])
             try:
@@ -72,8 +72,9 @@ class Admit:
             if not external and len(db.get_runs_by_status("running")) >= SLOTS:
                 return self.wait(sr,"queued","Все исполнители заняты")
             rid = db.create_run(sr_id)
-            if not db.acquire_locks(rid,locks):
-                raise RuntimeError("Конфликт блокировок внутри транзакции допуска.")
+            if not external:
+                if not db.acquire_locks(rid,locks):
+                    raise RuntimeError("Конфликт блокировок внутри транзакции допуска.")
             db.update_stage_request_status(sr_id,"approved")
             status = "waiting_external" if external else "running"
             db.update_run_status(rid,status,started_at=time.time())
